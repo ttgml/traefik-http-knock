@@ -1,0 +1,16 @@
+.git
+.gitignore
+.github
+*.md
+LICENSE
+Makefile
+docker-compose.yml
+*_test.go
+deploy/namespace.yaml
+deploy/redis.yaml
+deploy/middleware.yaml
+deploy/ingressroute.yaml
+deploy/helmchartconfig.yaml
+deploy/plugin-configmap.yaml
+deploy/traefik-compose.yml
+deploy/traefik-compose-dynamic.yml

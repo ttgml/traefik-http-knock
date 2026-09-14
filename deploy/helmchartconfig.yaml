@@ -1,0 +1,47 @@
+# k3s manages Traefik through a Helm chart in kube-system. HelmChartConfig
+# patches that chart (it must live in the chart's namespace, kube-system).
+#
+# Pick ONE of the two options below and delete the other.
+#
+#   Option A (recommended): custom image with the plugin baked in.
+#   Option B: ConfigMap mount, no custom image (ConfigMaps are capped at 1 MiB
+#             and every plugin change needs a ConfigMap refresh + restart).
+#
+# Both options pass the plugin module name through additionalArguments so the
+# value cannot be lost by chart value naming changes.
+#
+# Apply with:
+#   kubectl apply -f deploy/helmchartconfig.yaml
+#   kubectl -n kube-system rollout status deploy/traefik
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    # ---------------------------------------------------------------- Option A
+    image:
+      repository: ghcr.io/ttgml/traefik-http-knock
+      tag: v0.1.0
+      pullPolicy: IfNotPresent
+    additionalArguments:
+      - "--experimental.localPlugins.httpKnock.moduleName=github.com/ttgml/traefik-http-knock"
+
+    # ---------------------------------------------------------------- Option B
+    # Comment out the image block above and uncomment the following instead.
+    # The ConfigMap must exist in kube-system:
+    #   make k8s-plugin-configmap K8S_NAMESPACE=kube-system
+    #   kubectl apply -f deploy/plugin-configmap.yaml
+    #
+    # additionalArguments:
+    #   - "--experimental.localPlugins.httpKnock.moduleName=github.com/ttgml/traefik-http-knock"
+    # deployment:
+    #   additionalVolumes:
+    #     - name: http-knock-plugin
+    #       configMap:
+    #         name: http-knock-plugin
+    #   additionalVolumeMounts:
+    #     - name: http-knock-plugin
+    #       mountPath: /plugins-local/src/github.com/ttgml/traefik-http-knock

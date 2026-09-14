@@ -1,0 +1,33 @@
+# Dynamic configuration for the local docker compose demo: one router for
+# everything, protected by the http-knock middleware, proxying to whoami.
+http:
+  routers:
+    whoami:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - web
+      middlewares:
+        - http-knock
+      service: whoami
+
+  middlewares:
+    http-knock:
+      plugin:
+        httpKnock:
+          knockPath: "/__knock__/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          ttl: "2h"
+          redisAddr: "redis:6379"
+          redisPassword: "devpassword"
+          keyPrefix: "traefik:http-knock:"
+          failClosed: true
+          dialTimeout: "2s"
+          readTimeout: "1s"
+          writeTimeout: "1s"
+          redisPoolSize: 16
+          logClientIP: true
+
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: "http://whoami:80"

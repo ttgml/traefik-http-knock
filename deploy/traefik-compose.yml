@@ -1,0 +1,22 @@
+# Static configuration for the local docker compose demo.
+#
+# The knock secret and Redis password below are development placeholders:
+# never reuse them in production.
+entryPoints:
+  web:
+    address: ":8000"
+
+providers:
+  # A file provider keeps the demo independent of the Docker socket / API
+  # version negotiation.
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+experimental:
+  localPlugins:
+    httpKnock:
+      moduleName: github.com/ttgml/traefik-http-knock
+
+log:
+  level: INFO

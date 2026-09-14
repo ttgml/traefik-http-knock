@@ -1,0 +1,102 @@
+# Demo backend ("whoami") plus an IngressRoute that puts every request to
+# example.com behind the http-knock middleware.
+#
+# Replace example.com with your host. The knock URL must be served by the same
+# router, so it is matched by the same Host rule and handled by the middleware
+# before any request reaches the backend.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: traefik-http-knock
+  labels:
+    app.kubernetes.io/name: whoami
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: whoami
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: whoami
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: whoami
+          image: traefik/whoami:v1.10.1
+          ports:
+            - name: http
+              containerPort: 80
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: traefik-http-knock
+  labels:
+    app.kubernetes.io/name: whoami
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: whoami
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: whoami
+  namespace: traefik-http-knock
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host(`example.com`)
+      kind: Rule
+      middlewares:
+        - name: http-knock
+      services:
+        - name: whoami
+          port: 80
+---
+# Optional: same route over TLS. Enable only after a TLS secret/certResolver
+# exists in the cluster.
+#
+# apiVersion: traefik.io/v1alpha1
+# kind: IngressRoute
+# metadata:
+#   name: whoami-tls
+#   namespace: traefik-http-knock
+# spec:
+#   entryPoints:
+#     - websecure
+#   routes:
+#     - match: Host(`example.com`)
+#       kind: Rule
+#       middlewares:
+#         - name: http-knock
+#       services:
+#         - name: whoami
+#           port: 80
+#   tls:
+#     certResolver: letsencrypt

@@ -1,0 +1,155 @@
+# Ephemeral Redis used as the allowlist state store.
+#
+# The allowlist is intentionally expendable: Redis holds no data worth a volume,
+# so persistence is disabled and a restart simply forces clients to knock again.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-auth
+  namespace: traefik-http-knock
+type: Opaque
+stringData:
+  # CHANGE ME before applying. Generate with: openssl rand -hex 24
+  password: "REPLACE_WITH_REDIS_PASSWORD"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: traefik-http-knock
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: allowlist-store
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: allowlist-store
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            # Password comes from the Secret through the environment, so it
+            # never appears in the pod spec or in `ps` output.
+            - "--requirepass"
+            - "$(REDIS_PASSWORD)"
+            - "--save"
+            - ""
+            - "--appendonly"
+            - "no"
+            - "--maxmemory"
+            - "128mb"
+            # Never evict allowlist keys: TTL expiry must be the only removal
+            # mechanism. Size maxmemory for peak knock traffic instead.
+            - "--maxmemory-policy"
+            - "noeviction"
+            - "--timeout"
+            - "0"
+            - "--tcp-keepalive"
+            - "60"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+            # Used by the probes so the password is not passed on the command
+            # line of redis-cli.
+            - name: REDISCLI_AUTH
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -h 127.0.0.1 ping | grep -q PONG"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -h 127.0.0.1 ping | grep -q PONG"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 192Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: traefik-http-knock
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+---
+# Only Traefik may reach Redis. k3s runs Traefik in kube-system.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: redis-allow-traefik
+  namespace: traefik-http-knock
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 6379

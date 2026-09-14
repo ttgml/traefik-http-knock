@@ -1,0 +1,28 @@
+# Static configuration used by the custom Traefik image (Dockerfile) and by
+# `docker run` (mount it at /etc/traefik/traefik.yml).
+#
+# On k3s this file is shadowed by the traefik chart's own configuration file;
+# there the local plugin is enabled with additionalArguments instead (see
+# deploy/helmchartconfig.yaml).
+entryPoints:
+  web:
+    address: ":80"
+  websecure:
+    address: ":443"
+
+providers:
+  kubernetesCRD: {}
+
+experimental:
+  localPlugins:
+    httpKnock:
+      moduleName: github.com/ttgml/traefik-http-knock
+
+log:
+  level: INFO
+
+# SECURITY: Traefik access logs contain the full request path, which includes
+# the knock secret. Only enable access logging after filtering or dropping
+# requests whose path starts with "/__knock__/".
+#
+# accessLog: {}

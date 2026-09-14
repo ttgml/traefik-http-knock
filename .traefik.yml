@@ -1,0 +1,14 @@
+displayName: HTTP Knock
+type: middleware
+import: github.com/ttgml/traefik-http-knock
+summary: 'Temporary IP allowlist based on HTTP knock requests, backed by Redis TTLs.'
+testData:
+  knockPath: "/__knock__/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  ttl: "2h"
+  redisAddr: "127.0.0.1:6379"
+  keyPrefix: "traefik:http-knock:"
+  failClosed: true
+  dialTimeout: "2s"
+  readTimeout: "1s"
+  writeTimeout: "1s"
+  redisPoolSize: 16

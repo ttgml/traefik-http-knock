@@ -7,6 +7,7 @@ testData:
   ttl: "2h"
   redisAddr: "127.0.0.1:6379"
   keyPrefix: "traefik:http-knock:"
+  staticAllowlist: []
   failClosed: true
   dialTimeout: "2s"
   readTimeout: "1s"

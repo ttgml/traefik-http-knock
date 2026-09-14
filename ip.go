@@ -120,3 +120,63 @@ func validHeaderName(name string) bool {
 	}
 	return true
 }
+
+// staticAllowlist is the parsed form of Config.StaticAllowlist. It matches
+// client IPs that are allowed permanently, independently of knocks and Redis.
+// The zero value matches nothing, so an omitted configuration never allows
+// anyone.
+type staticAllowlist struct {
+	ips      []net.IP
+	networks []*net.IPNet
+}
+
+// parseStaticAllowlist validates and parses the configured entries. Each entry
+// is either a single IP address ("10.0.0.1", "2001:db8::1") or a CIDR range
+// ("10.0.0.0/8", "2001:db8::/32"). Entries are validated at configuration time
+// so a typo can never silently allow or deny the wrong clients.
+func parseStaticAllowlist(entries []string) (*staticAllowlist, error) {
+	allow := &staticAllowlist{}
+	for _, raw := range entries {
+		entry := strings.TrimSpace(raw)
+		if entry == "" {
+			return nil, errors.New("http-knock: staticAllowlist must not contain an empty entry")
+		}
+		if strings.Contains(entry, "/") {
+			_, network, err := net.ParseCIDR(entry)
+			if err != nil {
+				return nil, fmt.Errorf("http-knock: staticAllowlist entry %q is not a valid CIDR range", entry)
+			}
+			allow.networks = append(allow.networks, network)
+			continue
+		}
+		ip := net.ParseIP(entry)
+		if ip == nil {
+			return nil, fmt.Errorf("http-knock: staticAllowlist entry %q is not a valid IP address", entry)
+		}
+		allow.ips = append(allow.ips, ip)
+	}
+	return allow, nil
+}
+
+// contains reports whether the normalized client IP is on the static
+// allowlist. It is safe to call on a nil receiver.
+func (a *staticAllowlist) contains(clientIP string) bool {
+	if a == nil || (len(a.ips) == 0 && len(a.networks) == 0) {
+		return false
+	}
+	ip := net.ParseIP(clientIP)
+	if ip == nil {
+		return false
+	}
+	for _, candidate := range a.ips {
+		if candidate.Equal(ip) {
+			return true
+		}
+	}
+	for _, network := range a.networks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}

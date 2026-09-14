@@ -163,7 +163,11 @@ func TestConfigValidate(t *testing.T) {
 			c.WriteTimeout = "250ms"
 			c.RedisPoolSize = 2
 			c.LogClientIP = true
+			c.StaticAllowlist = []string{"10.0.0.1", "192.168.0.0/16", "2001:db8::/32"}
 		}},
+		{name: "static allowlist with a bad ip", mutate: func(c *Config) { c.StaticAllowlist = []string{"10.0.0.1", "not-an-ip"} }, wantErr: "staticAllowlist"},
+		{name: "static allowlist with a bad cidr", mutate: func(c *Config) { c.StaticAllowlist = []string{"10.0.0.0/33"} }, wantErr: "staticAllowlist"},
+		{name: "static allowlist with an empty entry", mutate: func(c *Config) { c.StaticAllowlist = []string{""} }, wantErr: "staticAllowlist"},
 		{name: "empty knock path", mutate: func(c *Config) { c.KnockPath = "" }, wantErr: "knockPath must not be empty"},
 		{name: "relative knock path", mutate: func(c *Config) { c.KnockPath = "__knock__/secret-value" }, wantErr: "must start with"},
 		{name: "root knock path", mutate: func(c *Config) { c.KnockPath = "/" }, wantErr: "must not be \"/\""},
@@ -621,6 +625,71 @@ func TestClientIPHeaderIsUsedWhenConfigured(t *testing.T) {
 	handler.ServeHTTP(rec, allowed)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if backend.callCount() != 1 {
+		t.Fatalf("backend calls = %d, want 1", backend.callCount())
+	}
+}
+
+func TestStaticAllowlistBypassesKnockAndRedis(t *testing.T) {
+	handler, backend, srv := newHarness(t, func(c *Config) {
+		c.StaticAllowlist = []string{"10.9.0.0/16", "203.0.113.5"}
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodGet, "https://example.com/private", "10.9.1.2:1234"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a statically allowlisted client", rec.Code)
+	}
+	if backend.callCount() != 1 {
+		t.Fatalf("backend calls = %d, want 1", backend.callCount())
+	}
+	for _, cmd := range srv.recordedCommands() {
+		if strings.HasPrefix(cmd, "EXISTS") {
+			t.Fatalf("a static allowlist hit must not touch Redis, saw %q", cmd)
+		}
+	}
+
+	// A client outside the static allowlist still needs a knock.
+	other := httptest.NewRecorder()
+	handler.ServeHTTP(other, newRequest(http.MethodGet, "https://example.com/private", "10.10.0.1:1234"))
+	if other.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for a client outside the allowlist", other.Code)
+	}
+}
+
+func TestStaticAllowlistMatchesExactIPv6(t *testing.T) {
+	handler, backend, _ := newHarness(t, func(c *Config) {
+		c.StaticAllowlist = []string{"2001:db8::1"}
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodGet, "https://example.com/private", "[2001:0DB8::1]:1234"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for a statically allowlisted IPv6 client", rec.Code)
+	}
+	if backend.callCount() != 1 {
+		t.Fatalf("backend calls = %d, want 1", backend.callCount())
+	}
+}
+
+func TestStaticAllowlistWorksWhenRedisIsUnreachable(t *testing.T) {
+	backend := &recordingBackend{}
+	cfg := CreateConfig()
+	cfg.KnockPath = testKnockPath
+	cfg.RedisAddr = closedAddr(t)
+	cfg.DialTimeout = "50ms"
+	cfg.StaticAllowlist = []string{"10.9.0.1"}
+
+	handler, err := New(context.Background(), backend, cfg, "test")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodGet, "https://example.com/private", "10.9.0.1:1234"))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 even though Redis is down", rec.Code)
 	}
 	if backend.callCount() != 1 {
 		t.Fatalf("backend calls = %d, want 1", backend.callCount())

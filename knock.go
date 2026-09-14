@@ -91,6 +91,17 @@ type Config struct {
 	// X-Forwarded-For the left-most (client) entry is used.
 	ClientIPHeader string `json:"clientIPHeader,omitempty"`
 
+	// StaticAllowlist is an optional list of IP addresses and CIDR ranges that
+	// are always allowed, independently of knocks and of Redis. Entries are
+	// single IPs ("10.0.0.1", "2001:db8::1") or CIDR ranges ("10.0.0.0/8",
+	// "2001:db8::/32").
+	//
+	// SECURITY: static entries are matched against the resolved client IP, so
+	// they inherit the trust of how that IP is determined. When ClientIPHeader
+	// is set without a trusted proxy overwriting it, a client can spoof an IP
+	// and match a static entry.
+	StaticAllowlist []string `json:"staticAllowlist,omitempty"`
+
 	// FailClosed controls what happens when Redis cannot be reached. It is a
 	// pointer so that "unset" can be distinguished from an explicit false:
 	// unset means fail closed (true), which is the safe default. An explicit
@@ -147,6 +158,7 @@ type settings struct {
 	writeTimeout   time.Duration
 	redisPoolSize  int
 	logClientIP    bool
+	allowlist      *staticAllowlist
 }
 
 // Validate checks the configuration and returns a descriptive error when it is
@@ -236,6 +248,12 @@ func (c *Config) settings() (*settings, error) {
 	if s.keyPrefix == "" {
 		s.keyPrefix = DefaultKeyPrefix
 	}
+
+	allowlist, err := parseStaticAllowlist(c.StaticAllowlist)
+	if err != nil {
+		return nil, err
+	}
+	s.allowlist = allowlist
 
 	s.failClosed = c.FailClosed == nil || *c.FailClosed
 
@@ -387,12 +405,19 @@ func (m *middleware) handleKnock(rw http.ResponseWriter, req *http.Request) {
 }
 
 // handleProtected allowlists a normal request when the client IP is still
-// present in Redis.
+// present in Redis, or when it is on the static allowlist. A static entry
+// bypasses Redis entirely, so it keeps working during a state-store outage.
 func (m *middleware) handleProtected(rw http.ResponseWriter, req *http.Request) {
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
 		m.logf("request denied: %v", err)
 		http.Error(rw, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+		return
+	}
+
+	if m.cfg.allowlist.contains(ip) {
+		m.logf("request allowed for client %s: static allowlist", m.clientLabel(ip))
+		m.next.ServeHTTP(rw, req)
 		return
 	}
 

@@ -238,3 +238,62 @@ func TestConstantTimeEqualString(t *testing.T) {
 		t.Fatal("empty strings must be equal")
 	}
 }
+
+func TestParseStaticAllowlist(t *testing.T) {
+	tests := []struct {
+		name    string
+		entries []string
+		ip      string
+		want    bool
+	}{
+		{name: "exact ipv4", entries: []string{"203.0.113.7"}, ip: "203.0.113.7", want: true},
+		{name: "exact ipv4 mismatch", entries: []string{"203.0.113.7"}, ip: "203.0.113.8", want: false},
+		{name: "exact ipv6", entries: []string{"2001:db8::1"}, ip: "2001:db8::1", want: true},
+		{name: "ipv4 mapped matches plain ipv4", entries: []string{"10.0.0.1"}, ip: "10.0.0.1", want: true},
+		{name: "ipv4 cidr inside", entries: []string{"10.0.0.0/24"}, ip: "10.0.0.99", want: true},
+		{name: "ipv4 cidr outside", entries: []string{"10.0.0.0/24"}, ip: "10.0.1.1", want: false},
+		{name: "ipv6 cidr inside", entries: []string{"2001:db8::/32"}, ip: "2001:db8:1::5", want: true},
+		{name: "ipv6 cidr outside", entries: []string{"2001:db8::/32"}, ip: "2001:db9::1", want: false},
+		{name: "host bits are masked", entries: []string{"10.0.0.5/24"}, ip: "10.0.0.200", want: true},
+		{name: "mixed entries", entries: []string{"10.0.0.0/8", "2001:db8::1", "192.168.0.0/16"}, ip: "192.168.5.5", want: true},
+		{name: "surrounding whitespace", entries: []string{"  10.0.0.1  "}, ip: "10.0.0.1", want: true},
+		{name: "empty allowlist", entries: nil, ip: "10.0.0.1", want: false},
+		{name: "empty ip", entries: []string{"10.0.0.1"}, ip: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			allow, err := parseStaticAllowlist(tt.entries)
+			if err != nil {
+				t.Fatalf("parseStaticAllowlist(%v): %v", tt.entries, err)
+			}
+			if got := allow.contains(tt.ip); got != tt.want {
+				t.Fatalf("contains(%q) = %v, want %v", tt.ip, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseStaticAllowlistRejectsBadEntries(t *testing.T) {
+	for _, entry := range []string{
+		"",
+		"   ",
+		"not-an-ip",
+		"999.1.1.1",
+		"example.com",
+		"10.0.0.0/33",
+		"10.0.0.1/abc",
+		"2001:db8::/129",
+	} {
+		if _, err := parseStaticAllowlist([]string{entry}); err == nil {
+			t.Fatalf("parseStaticAllowlist(%q) must fail", entry)
+		}
+	}
+}
+
+func TestStaticAllowlistNilContainsNothing(t *testing.T) {
+	var allow *staticAllowlist
+	if allow.contains("10.0.0.1") {
+		t.Fatal("a nil allowlist must match nothing")
+	}
+}

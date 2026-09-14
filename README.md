@@ -86,6 +86,7 @@ push somewhere else.)
 | Non-GET requests handled like any other protected path (no path oracle) | implemented |
 | `204` + `Cache-Control: no-store` on successful knock | implemented |
 | Client IP from `RemoteAddr` or a configured header | implemented |
+| Static allowlist of IPs and CIDR ranges (always allowed) | implemented |
 | IPv4 and IPv6, canonicalized (`2001:0DB8::1` == `2001:db8::1`) | implemented |
 | Fail closed on Redis errors (`503`) | implemented |
 | Bounded connection pool, timeouts, connection reuse | implemented |
@@ -103,7 +104,9 @@ secure and deployable.
 2. If the request is **not** a `GET` whose `req.URL.Path` is (constant-time) equal
    to `knockPath`, the request is a **protected request**:
    * resolve the client IP,
-   * `EXISTS <keyPrefix><clientIP>` in Redis,
+   * client IP on the static allowlist → `next.ServeHTTP()` (no Redis call, so
+     this keeps working during a Redis outage),
+   * otherwise `EXISTS <keyPrefix><clientIP>` in Redis,
    * key present → `next.ServeHTTP()` (the backend is reached),
    * key absent → `403 Forbidden`,
    * Redis error → `503 Service Unavailable` (fail closed), or `next.ServeHTTP()`
@@ -167,6 +170,7 @@ allowlist their own IP until the TTL expires.
 | Knock request reaching the backend | The middleware terminates the request itself and never calls `next` for a knock, including when `failClosed: false` |
 | Redis outage turning into an allow | Fail closed: `503`, never `next` for protected requests unless the operator explicitly sets `failClosed: false`. A knock is always terminated with `503` |
 | Header spoofing (`X-Forwarded-For` etc.) | Off by default (`RemoteAddr` is used). `clientIPHeader` must only be set when a trusted proxy overwrites it |
+| Static allowlist entries matching a spoofed client IP | Static entries match the resolved client IP, so they share the trust of `clientIPHeader`; keep it empty unless a trusted proxy overwrites it |
 | Secret leaking into logs | Knock URLs, paths and Redis credentials are never logged. Use `logClientIP: true` only if you accept logging client IPs |
 | Brute force on the knock path | Not covered by v1. Put the knock path behind a rate limit (`rateLimit` middleware) and/or a non-guessable secret, or wait for the HMAC token knock |
 | Redis compromise/exposure | Run Redis in-cluster, require a password, restrict it with a `NetworkPolicy` (see `deploy/redis.yaml`) |
@@ -205,6 +209,14 @@ httpKnock:
   # "X-Real-IP", "CF-Connecting-IP", "X-Forwarded-For", ...
   # Empty (default) means req.RemoteAddr (not spoofable).
   clientIPHeader: ""
+
+  # Optional. IPs and CIDR ranges that are always allowed: no knock and no
+  # Redis lookup. Entries are single IPs or CIDR ranges, IPv4 or IPv6. Empty
+  # (default) means only knocks grant access. Validated at load time.
+  staticAllowlist: []
+  #  - "203.0.113.7"
+  #  - "192.168.0.0/16"
+  #  - "2001:db8::/32"
 
   # true (default): Redis errors return 503. false: Redis errors let the
   # request through (fail open). Never use false on a security boundary.

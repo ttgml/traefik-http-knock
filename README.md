@@ -22,8 +22,9 @@ no in-memory state and starts no cleanup goroutines.
 - Fail closed by default: a Redis outage returns `503`, never `allow`
 
 Verified end to end against Traefik v3.2.5 (local plugin, Yaegi) and Redis 7.4:
-`403` before the knock, `405` for non-GET, `204` + `Cache-Control: no-store` for
-a successful knock, `200` afterwards, and `503` while Redis was unreachable.
+`403` before the knock, `204` + `Cache-Control: no-store` for a successful knock,
+`200` afterwards, `403` for non-GET requests (identical to any other path), and
+`503` while Redis was unreachable.
 
 ```text
                    Internet
@@ -82,7 +83,7 @@ push somewhere else.)
 | Secret path knock (`GET /__knock__/<secret>`) | implemented |
 | Redis TTL allowlist (state store only, no Go timers) | implemented |
 | `403` for non-allowlisted clients | implemented |
-| `405` for non-GET knock attempts | implemented |
+| Non-GET requests handled like any other protected path (no path oracle) | implemented |
 | `204` + `Cache-Control: no-store` on successful knock | implemented |
 | Client IP from `RemoteAddr` or a configured header | implemented |
 | IPv4 and IPv6, canonicalized (`2001:0DB8::1` == `2001:db8::1`) | implemented |
@@ -99,20 +100,25 @@ secure and deployable.
 ## 2. How it works
 
 1. Traefik routes the request to the middleware (`Middleware` CRD or labels).
-2. If `req.URL.Path` is not (constant-time) equal to `knockPath`, the request is
-   a **protected request**:
+2. If the request is **not** a `GET` whose `req.URL.Path` is (constant-time) equal
+   to `knockPath`, the request is a **protected request**:
    * resolve the client IP,
    * `EXISTS <keyPrefix><clientIP>` in Redis,
    * key present → `next.ServeHTTP()` (the backend is reached),
    * key absent → `403 Forbidden`,
-   * Redis error → `503 Service Unavailable` (fail closed).
-3. If the path matches, the request is a **knock**:
-   * method must be `GET`, otherwise `405 Method Not Allowed` with `Allow: GET`,
+   * Redis error → `503 Service Unavailable` (fail closed), or `next.ServeHTTP()`
+     when the operator explicitly set `failClosed: false`.
+3. If the request is a `GET` whose path matches, it is a **knock**:
    * resolve the client IP,
    * `SET <keyPrefix><clientIP> 1 EX <ttl>`,
    * success → `204 No Content`, `Cache-Control: no-store`, `X-Knock-TTL: 2h0m0s`,
-   * Redis error → `503 Service Unavailable` (fail closed),
+   * Redis error → `503 Service Unavailable`, regardless of `failClosed`,
    * the request is always terminated here and never reaches the backend.
+
+Only `GET` is a knock. Any other method (including `HEAD`) to the knock path is
+handled exactly like a request to any other protected path and answers `403`
+unless the client is already allowlisted, so it cannot be used to confirm a
+guessed secret path.
 
 The middleware never modifies the request (method, host, URL, authorization,
 cookies, headers, body) nor the backend response. It only answers
@@ -156,9 +162,10 @@ allowlist their own IP until the TTL expires.
 | --- | --- |
 | Guessable knock path | Use a 128-bit random secret (`openssl rand -hex 32`); minimum length is enforced at config time (16 chars) |
 | Timing side channel on the secret | Constant-time path comparison (length is not secret) |
+| Status-code oracle on the secret path | Only `GET` is a knock; non-GET requests get the same `403` for the secret path and any other path, so no distinct status reveals a match |
 | Response caching by browsers/proxies | `Cache-Control: no-store` and `Pragma: no-cache` on knock responses |
-| Knock request reaching the backend | The middleware terminates the request itself and never calls `next` for a knock |
-| Redis outage turning into an allow | Fail closed: `503`, never `next` (unless the operator explicitly sets `failClosed: false`) |
+| Knock request reaching the backend | The middleware terminates the request itself and never calls `next` for a knock, including when `failClosed: false` |
+| Redis outage turning into an allow | Fail closed: `503`, never `next` for protected requests unless the operator explicitly sets `failClosed: false`. A knock is always terminated with `503` |
 | Header spoofing (`X-Forwarded-For` etc.) | Off by default (`RemoteAddr` is used). `clientIPHeader` must only be set when a trusted proxy overwrites it |
 | Secret leaking into logs | Knock URLs, paths and Redis credentials are never logged. Use `logClientIP: true` only if you accept logging client IPs |
 | Brute force on the knock path | Not covered by v1. Put the knock path behind a rate limit (`rateLimit` middleware) and/or a non-guessable secret, or wait for the HMAC token knock |
@@ -571,7 +578,7 @@ Behind Cloudflare (or any reverse proxy / ingress in front of Traefik):
 | --- | --- | --- |
 | Every request `403` after a successful knock | Knock and access use different source IPs (proxy, NAT, IPv6/IPv4 mix) | Log the resolved IP (`logClientIP: true`) and check which header/hop is used; compare with `redis-cli --scan` |
 | Every request `503` | Redis unreachable, wrong `redisAddr`, auth failure, or `SELECT` to a disabled DB | `kubectl -n traefik-http-knock logs deploy/redis`, check the Secret, test with `redis-cli -h ... -a ...` |
-| `405` on the knock URL | Non-GET method | Use `curl` without `-X POST`/`-d` |
+| `403` on the knock URL with a non-GET method | Only `GET` knocks; other methods are treated as protected requests | Use `curl -i` (a `GET`); `curl -I` sends `HEAD` and will not knock |
 | Knock returns `204` but nothing is stored | Wrong Redis DB/prefix or you are looking at another Redis | Compare `keyPrefix` and `redisDB`, inspect with `redis-cli --scan --pattern '<prefix>*'` |
 | Traefik logs `command not found` / plugin not loaded | `moduleName` does not match `go.mod`, or source is not in `/plugins-local/src/<moduleName>` | Check the mount path and the `additionalArguments` value (case-sensitive) |
 | Plugin config rejected at startup | Invalid `knockPath`/`ttl`/timeouts | The error message names the field; see section 5 |
@@ -635,7 +642,7 @@ Verified live against **Traefik v3.2.5 + Redis 7.4** during development:
 | Scenario | Result |
 | --- | --- |
 | Protected request before any knock | `403` |
-| `POST` to the knock path | `405`, `Allow: GET`, no Redis call, no backend call |
+| `POST` to the knock path | `403`, no Redis write, no backend call (same response as any other path) |
 | `GET` to the knock path | `204`, `Cache-Control: no-store`, `Pragma: no-cache`, `X-Knock-Ttl`, Redis key `1` with `TTL 7200` |
 | Protected request after the knock | `200`, backend reached |
 | Redis stopped | `503` for both knock and protected requests, no panic |
@@ -665,13 +672,14 @@ $ curl -i https://example.com/
 HTTP/2 403
 ```
 
-Wrong method (note: `HEAD` counts as a non-GET method, so `curl -I <knock-url>`
-also answers `405` — use `curl -i`):
+Wrong method (only `GET` knocks; a `POST` — and `curl -I`, which sends `HEAD` —
+is treated as a protected request and answers the same `403` as any other path,
+so it does not confirm the secret):
 
 ```bash
 $ curl -i -X POST https://example.com/__knock__/9c4e...f9
-HTTP/2 405
-allow: GET
+HTTP/2 403
+forbidden
 ```
 
 Wrong path (no knock, no access):

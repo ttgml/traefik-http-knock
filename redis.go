@@ -215,19 +215,43 @@ func readRESP(r *bufio.Reader, depth int) (respValue, error) {
 
 // Bounds that keep a misbehaving peer from allocating arbitrary memory.
 const (
-	maxBulkLength  = 512 * 1024 * 1024
+	// maxBulkLength bounds a single bulk string. The commands this plugin uses
+	// (AUTH, SELECT, PING, EXISTS, SET) only ever return short bulk strings, so
+	// this is far above any legitimate reply while stopping a hostile or broken
+	// peer from making the plugin allocate hundreds of megabytes.
+	maxBulkLength = 1 << 20
+	// maxLineLength bounds a single reply header line (simple strings, errors,
+	// integers and bulk/array lengths). Redis error messages are a few hundred
+	// bytes at most, so this is generous.
+	maxLineLength  = 64 * 1024
 	maxArrayLength = 1 << 20
 )
 
+// readLine reads one CRLF-terminated RESP line. Its length is bounded so that a
+// peer that never sends a newline cannot grow the read buffer without limit.
 func readLine(r *bufio.Reader) (string, error) {
-	line, err := r.ReadString('\n')
-	if err != nil {
-		return "", err
+	var line []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(line)+len(chunk) > maxLineLength {
+			return "", errors.New("redis: reply line exceeds the maximum length")
+		}
+		line = append(line, chunk...)
+
+		if err == bufio.ErrBufferFull {
+			// The line is longer than the reader's buffer; keep reading until
+			// the newline or the bound above is reached.
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		break
 	}
 	if len(line) < 2 || line[len(line)-2] != '\r' {
 		return "", errors.New("redis: line not terminated by CRLF")
 	}
-	return line[:len(line)-2], nil
+	return string(line[:len(line)-2]), nil
 }
 
 // ioReadFull is a tiny wrapper so that the RESP reader stays easy to reason

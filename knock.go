@@ -275,7 +275,9 @@ type knockVerifier interface {
 }
 
 // pathVerifier authorizes a knock when the request path equals the configured
-// secret path exactly.
+// secret path exactly. The middleware only calls it for GET requests, so a
+// non-GET request to the path is handled like any other protected request and
+// cannot confirm a guessed secret through a distinct status code.
 type pathVerifier struct {
 	path string
 }
@@ -338,8 +340,15 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 }
 
 // ServeHTTP implements http.Handler.
+//
+// A knock is defined as "GET <knockPath>". Requiring GET keeps a non-GET
+// request to the secret path indistinguishable from a request to any other
+// protected path: both resolve the client IP, run the same allowlist lookup and
+// answer 403. Returning a method-specific status only for the real path would
+// otherwise hand an unauthenticated client a reliable oracle for guessing the
+// secret, defeating the constant-time path comparison.
 func (m *middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
-	if m.verifier.Matches(req) {
+	if req.Method == http.MethodGet && m.verifier.Matches(req) {
 		m.handleKnock(rw, req)
 		return
 	}
@@ -347,15 +356,9 @@ func (m *middleware) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 }
 
 // handleKnock stores the client IP in Redis and terminates the request. The
-// knock request is never forwarded to the backend.
+// knock request is never forwarded to the backend, not even when Redis is
+// unreachable and the middleware fails open.
 func (m *middleware) handleKnock(rw http.ResponseWriter, req *http.Request) {
-	if req.Method != http.MethodGet {
-		rw.Header().Set("Allow", http.MethodGet)
-		m.logf("knock rejected: method %s is not allowed", req.Method)
-		http.Error(rw, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
-		return
-	}
-
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
 		// Deliberately 403 and not 400: do not confirm that the path matched.
@@ -372,7 +375,7 @@ func (m *middleware) handleKnock(rw http.ResponseWriter, req *http.Request) {
 
 	if err := m.redis.setEx(redisKey(m.cfg.keyPrefix, ip), knockValue, m.cfg.ttl); err != nil {
 		m.logf("redis unavailable during knock for client %s: %v", m.clientLabel(ip), err)
-		m.writeRedisFailure(rw, req)
+		m.writeKnockFailure(rw)
 		return
 	}
 
@@ -416,6 +419,15 @@ func (m *middleware) writeRedisFailure(rw http.ResponseWriter, req *http.Request
 		m.next.ServeHTTP(rw, req)
 		return
 	}
+	http.Error(rw, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
+}
+
+// writeKnockFailure reports a state-store failure for a knock. Unlike a
+// protected request, a knock is never forwarded to the backend, even when
+// failClosed is false: the knock URL carries the secret, so forwarding it would
+// leak the secret to the backend and break the "a knock never reaches the
+// backend" contract. Fail open only relaxes the allowlist lookup.
+func (m *middleware) writeKnockFailure(rw http.ResponseWriter) {
 	http.Error(rw, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
 }
 

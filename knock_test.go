@@ -313,7 +313,7 @@ func TestKnockSelectsRedisDB(t *testing.T) {
 	}
 }
 
-func TestKnockMethodNotAllowed(t *testing.T) {
+func TestNonGetKnockIsNotASpecialCase(t *testing.T) {
 	methods := []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodHead, http.MethodOptions}
 
 	for _, method := range methods {
@@ -323,19 +323,47 @@ func TestKnockMethodNotAllowed(t *testing.T) {
 			rec := httptest.NewRecorder()
 			handler.ServeHTTP(rec, newRequest(method, "https://example.com"+testKnockPath, "10.0.0.4:1234"))
 
-			if rec.Code != http.StatusMethodNotAllowed {
-				t.Fatalf("status = %d, want 405", rec.Code)
+			// A non-GET request to the secret path gets the same 403 as any
+			// other unknown path, so it cannot be used to confirm the secret.
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403", rec.Code)
 			}
-			if got := rec.Header().Get("Allow"); got != http.MethodGet {
-				t.Fatalf("Allow = %q, want GET", got)
+			if got := rec.Header().Get("Allow"); got != "" {
+				t.Fatalf("Allow = %q, want no Allow header to avoid confirming the path", got)
 			}
 			if backend.callCount() != 0 {
-				t.Fatal("a rejected knock must not reach the backend")
+				t.Fatal("a non-GET request to the knock path must not reach the backend")
 			}
 			if srv.get("traefik:http-knock:10.0.0.4") {
-				t.Fatal("a rejected knock must not store the client IP")
+				t.Fatal("a non-GET request must not knock")
 			}
 		})
+	}
+}
+
+// TestNonGetResponseDoesNotRevealKnockPath proves the oracle is gone: a non-GET
+// request to the real secret path and one to an unrelated path are byte-for-byte
+// indistinguishable.
+func TestNonGetResponseDoesNotRevealKnockPath(t *testing.T) {
+	handler, _, _ := newHarness(t, nil)
+
+	onKnockPath := httptest.NewRecorder()
+	handler.ServeHTTP(onKnockPath, newRequest(http.MethodPost, "https://example.com"+testKnockPath, "10.0.0.7:1234"))
+
+	onOtherPath := httptest.NewRecorder()
+	handler.ServeHTTP(onOtherPath, newRequest(http.MethodPost, "https://example.com/private", "10.0.0.7:1234"))
+
+	if onKnockPath.Code != onOtherPath.Code {
+		t.Fatalf("status differs: knock path %d, other path %d", onKnockPath.Code, onOtherPath.Code)
+	}
+	if onKnockPath.Body.String() != onOtherPath.Body.String() {
+		t.Fatalf("body differs: knock path %q, other path %q", onKnockPath.Body.String(), onOtherPath.Body.String())
+	}
+	if got, want := onKnockPath.Header().Get("Content-Type"), onOtherPath.Header().Get("Content-Type"); got != want {
+		t.Fatalf("Content-Type differs: %q vs %q", got, want)
+	}
+	if got, want := onKnockPath.Header().Get("X-Content-Type-Options"), onOtherPath.Header().Get("X-Content-Type-Options"); got != want {
+		t.Fatalf("X-Content-Type-Options differs: %q vs %q", got, want)
 	}
 }
 
@@ -511,11 +539,16 @@ func TestFailOpenWhenExplicitlyConfigured(t *testing.T) {
 		t.Fatalf("backend calls = %d, want 1", backend.callCount())
 	}
 
-	// A knock still cannot be acknowledged when the state store is down.
+	// A knock is never forwarded to the backend, even when failing open: its
+	// URL carries the secret. It simply cannot be acknowledged while Redis is
+	// down.
 	knock := httptest.NewRecorder()
 	handler.ServeHTTP(knock, newRequest(http.MethodGet, "https://example.com"+testKnockPath, "10.0.0.12:1234"))
-	if knock.Code != http.StatusOK {
-		t.Fatalf("knock status = %d, want 200 (fail open)", knock.Code)
+	if knock.Code != http.StatusServiceUnavailable {
+		t.Fatalf("knock status = %d, want 503 (a knock never reaches the backend)", knock.Code)
+	}
+	if backend.callCount() != 1 {
+		t.Fatalf("backend calls = %d, want 1: the knock must not be forwarded when failing open", backend.callCount())
 	}
 }
 

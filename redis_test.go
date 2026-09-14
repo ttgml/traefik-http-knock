@@ -582,9 +582,11 @@ func TestRESPDecoding(t *testing.T) {
 		{name: "bad integer", raw: ":abc\r\n", wantErr: "invalid integer reply"},
 		{name: "bad bulk length", raw: "$abc\r\n", wantErr: "invalid bulk length"},
 		{name: "huge bulk length", raw: "$999999999999\r\n", wantErr: "exceeds limit"},
+		{name: "bulk length just above the limit", raw: "$" + strconv.Itoa(maxBulkLength+1) + "\r\n", wantErr: "exceeds limit"},
 		{name: "bad array length", raw: "*abc\r\n", wantErr: "invalid array length"},
 		{name: "bulk without CRLF terminator", raw: "$2\r\nfoo\r\n", wantErr: "not terminated by CRLF"},
 		{name: "line without carriage return", raw: "+OK\n", wantErr: "not terminated by CRLF"},
+		{name: "oversized reply line", raw: "+" + strings.Repeat("a", maxLineLength) + "\r\n", wantErr: "exceeds the maximum length"},
 		{name: "reply nesting too deep", raw: strings.Repeat("*1\r\n", 12) + "+OK\r\n", wantErr: "nesting too deep"},
 	}
 

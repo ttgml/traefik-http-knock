@@ -373,7 +373,7 @@ experimental:
   plugins:
     httpKnock:
       moduleName: github.com/ttgml/traefik-http-knock
-      version: v0.1.0
+      version: v0.1.1
 ```
 
 Requirements for a catalog release:
@@ -388,8 +388,8 @@ Requirements for a catalog release:
 Then release:
 
 ```bash
-make release TAG=v0.1.0   # runs the checks and creates an annotated tag
-git push origin v0.1.0
+make release PLUGIN_VERSION=v0.1.1   # runs the checks and creates an annotated tag
+git push origin v0.1.1
 ```
 
 ### 8.2 Local plugin (source mounted into the container)
@@ -476,8 +476,8 @@ curl -i http://<node-ip>/                        # 200
 ### 9.1 Option A (recommended): custom Traefik image
 
 ```bash
-docker build -t ghcr.io/<user>/traefik-http-knock:v0.1.0 .
-docker push ghcr.io/<user>/traefik-http-knock:v0.1.0
+docker build -t ghcr.io/<user>/traefik-http-knock:v0.1.1 .
+docker push ghcr.io/<user>/traefik-http-knock:v0.1.1
 ```
 
 Point the k3s Traefik at it (see `deploy/helmchartconfig.yaml`, Option A block).

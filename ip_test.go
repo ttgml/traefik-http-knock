@@ -297,3 +297,39 @@ func TestStaticAllowlistNilContainsNothing(t *testing.T) {
 		t.Fatal("a nil allowlist must match nothing")
 	}
 }
+
+// TestValidHeaderName covers the names operators actually configure. The
+// regression this guards against is interpreter-specific (see
+// validHeaderName): real Go accepted them, Yaegi did not, so the cases with
+// uppercase letters or digits are the ones that matter.
+func TestValidHeaderName(t *testing.T) {
+	tests := []struct {
+		name  string
+		head  string
+		valid bool
+	}{
+		{name: "empty", head: "", valid: false},
+		{name: "cloudflare", head: "CF-Connecting-IP", valid: true},
+		{name: "canonicalised cloudflare", head: http.CanonicalHeaderKey("CF-Connecting-IP"), valid: true},
+		{name: "lowercase", head: "x-real-ip", valid: true},
+		{name: "x-forwarded-for", head: "X-Forwarded-For", valid: true},
+		{name: "letters only", head: "XRealIP", valid: true},
+		{name: "digits only", head: "1234", valid: true},
+		{name: "digits inside", head: "X-Real-IP-2", valid: true},
+		{name: "token specials", head: "_-.~^|`!#$%&'*+", valid: true},
+		{name: "space", head: "X Real IP", valid: false},
+		{name: "tab", head: "X-Real-IP\t", valid: false},
+		{name: "colon", head: "X-Real-IP:", valid: false},
+		{name: "newline", head: "X-Real-IP\n", valid: false},
+		{name: "non-ascii", head: "X-Réal", valid: false},
+		{name: "underscore-prefixed", head: "_realip", valid: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := validHeaderName(tt.head); got != tt.valid {
+				t.Errorf("validHeaderName(%q) = %v, want %v", tt.head, got, tt.valid)
+			}
+		})
+	}
+}

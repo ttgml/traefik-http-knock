@@ -105,6 +105,18 @@ func firstForwardedFor(value string) string {
 // validHeaderName reports whether name is a valid HTTP header field name
 // (RFC 7230 token). A misspelled header would otherwise silently fall back to
 // the peer address, which is safe but surprising for the operator.
+//
+// Every case clause holds exactly one expression on purpose. Yaegi (the
+// interpreter Traefik uses for plugins) only evaluates the first expression of
+// a comma-separated case list, so
+//
+//	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+//
+// silently accepted lowercase letters only: uppercase letters and digits fell
+// through to the default branch. Because http.CanonicalHeaderKey capitalises
+// the first letter ("CF-Connecting-IP" becomes "Cf-Connecting-Ip"), every real
+// header name was rejected. TestYaegiCompatAvoidsMultiExpressionCases guards
+// this invariant.
 func validHeaderName(name string) bool {
 	if name == "" {
 		return false
@@ -112,7 +124,9 @@ func validHeaderName(name string) bool {
 	for i := 0; i < len(name); i++ {
 		c := name[i]
 		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c >= 'a' && c <= 'z':
+		case c >= 'A' && c <= 'Z':
+		case c >= '0' && c <= '9':
 		case strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)):
 		default:
 			return false

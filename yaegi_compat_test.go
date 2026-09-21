@@ -149,6 +149,37 @@ func TestPluginExportsTraefikEntryPoints(t *testing.T) {
 	}
 }
 
+// TestYaegiCompatAvoidsMultiExpressionCases forbids comma-separated case lists
+// such as
+//
+//	case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+//
+// Yaegi v0.16.1 (shipped with Traefik v3.7) evaluates only the *first*
+// expression of such a list instead of OR-ing the entries, so the remaining
+// expressions are dead code. Real Go honours all of them, which makes this bug
+// invisible to `go test`: it only shows up when the plugin runs in Traefik.
+//
+// Write one expression per case clause instead; the extra clauses are free.
+func TestYaegiCompatAvoidsMultiExpressionCases(t *testing.T) {
+	fset := token.NewFileSet()
+	for _, file := range pluginSourceFiles(t) {
+		parsed, err := parser.ParseFile(fset, file, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", file, err)
+		}
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			clause, ok := node.(*ast.CaseClause)
+			if !ok || len(clause.List) < 2 {
+				return true
+			}
+			position := fset.Position(clause.Pos())
+			t.Errorf("%s:%d: case clause lists %d expressions; Yaegi evaluates only the first one, so use one case clause per expression",
+				file, position.Line, len(clause.List))
+			return true
+		})
+	}
+}
+
 func typeConfig(file *ast.File) (*ast.StructType, bool) {
 	for _, decl := range file.Decls {
 		gen, ok := decl.(*ast.GenDecl)

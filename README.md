@@ -639,7 +639,7 @@ The compose secret is a development placeholder — never reuse it.
 ### 13.2 Yaegi constraints (important for contributors)
 
 Local plugins are executed by Yaegi (`github.com/traefik/yaegi` v0.16.1 in
-Traefik v3.2), not by the Go runtime. Two rules follow:
+Traefik v3.2 and v3.7), not by the Go runtime. Three rules follow:
 
 1. **Standard library only.** Every import must be resolvable inside the Traefik
    image. `yaegi_compat_test.go` fails the build on any import whose first path
@@ -648,6 +648,18 @@ Traefik v3.2), not by the Go runtime. Two rules follow:
    them (`*target must be interface or implement error`), and Traefik recovers
    the panic into an HTTP `500`. This plugin classifies errors with direct type
    assertions on unwrapped errors instead; `yaegi_compat_test.go` enforces it.
+3. **One expression per `case` clause.** Yaegi v0.16.1 evaluates only the
+   *first* expression of a comma-separated case list instead of OR-ing the
+   entries, so the rest is dead code. Unlike rules 1 and 2 this produces no
+   panic and no error: `case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':`
+   silently accepted lowercase letters only, which made `clientIPHeader` reject
+   every real header name (because `http.CanonicalHeaderKey` capitalises the
+   first letter) and left `403` on all protected routes.
+   `TestYaegiCompatAvoidsMultiExpressionCases` enforces it.
+
+Because rules 2 and 3 only misbehave under the interpreter, `go test` cannot
+catch them on its own - the static guards above are what keep the plugin inside
+the Yaegi subset.
 
 Verified live against **Traefik v3.2.5 + Redis 7.4** during development:
 

@@ -40,10 +40,10 @@ requests (identical to any other path), and `503` while Redis was unreachable.
                        |
           +------------+-------------+
           |                          |
-   GET /__knock__/secret        普通请求
+   GET /__knock__/secret        protected request
           |                          |
           v                          v
-      验证 Knock                  Redis EXISTS
+      verify knock              Redis EXISTS
           |                          |
           v                    +-----+-----+
       Redis SETEX              |           |
@@ -168,7 +168,7 @@ allowlist their own IP until the TTL expires.
 
 | Risk | Mitigation |
 | --- | --- |
-| Guessable knock path | Use a 128-bit random secret (`openssl rand -hex 32`); minimum length is enforced at config time (16 chars) |
+| Guessable knock path | Use a 128-bit random secret (`openssl rand -hex 32`); length is enforced at config time (6–80 chars) |
 | Timing side channel on the secret | Constant-time path comparison (length is not secret) |
 | Status-code oracle on the secret path | Only `GET` is a knock; non-GET requests get the same `403` for the secret path and any other path, so no distinct status reveals a match |
 | Response caching by browsers/proxies | `Cache-Control: no-store` and `Pragma: no-cache` on knock responses |
@@ -195,7 +195,7 @@ Residual risks you must accept or handle outside the plugin:
 ```yaml
 httpKnock:
   # Required. Exact path that triggers the knock. Must start with "/",
-  # must not contain "?" or "#", minimum 16 characters.
+  # must not contain "?" or "#", 6 to 80 characters long.
   knockPath: "/__knock__/9c4e2e4e3b6d0c0f7b1a2c3d4e5f60718293a4b5c6d7e8f9"
   # Allowlist entry lifetime (Go duration). Redis expires the key.
   ttl: "2h"

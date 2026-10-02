@@ -35,11 +35,13 @@ const (
 	defaultWriteTimeout  = time.Second
 	defaultRedisPoolSize = 16
 
-	// minKnockPathLength is a weak lower bound on the knock path length. The
-	// real secret is the path itself, so a short path is only accepted to keep
-	// the plugin usable in tests; production deployments should use a 128-bit
-	// random secret (see README).
-	minKnockPathLength = 16
+	// minKnockPathLength and maxKnockPathLength bound the knock path. The real
+	// secret is the path itself, so a short path is only accepted to keep the
+	// plugin usable in tests; production deployments should use a 128-bit
+	// random secret (see README). The upper bound keeps the path well inside
+	// the request-line limits of Go's net/http, proxies and browsers.
+	minKnockPathLength = 6
+	maxKnockPathLength = 80
 
 	// knockTTLHeader advertises the configured TTL on a successful knock. It
 	// never contains infrastructure details.
@@ -56,8 +58,9 @@ const (
 // omitted.
 type Config struct {
 	// KnockPath is the exact request path that triggers a knock, for example
-	// "/__knock__/9c4e2e4e3b6d0c0f...". It must start with "/" and should embed
-	// a long random secret.
+	// "/__knock__/9c4e2e4e3b6d0c0f...". It must start with "/", must not
+	// contain "?" or "#", and must be between 6 and 80 characters long. It
+	// should embed a long random secret.
 	KnockPath string `json:"knockPath,omitempty"`
 
 	// TTL is the lifetime of an allowlist entry, expressed as a Go duration
@@ -210,6 +213,8 @@ func (c *Config) settings() (*settings, error) {
 		return nil, errors.New("http-knock: knockPath must not be \"/\" (it would knock on every request)")
 	case len(s.knockPath) < minKnockPathLength:
 		return nil, fmt.Errorf("http-knock: knockPath must be at least %d characters long, preferably a 128-bit random secret", minKnockPathLength)
+	case len(s.knockPath) > maxKnockPathLength:
+		return nil, fmt.Errorf("http-knock: knockPath must be at most %d characters long, got %d", maxKnockPathLength, len(s.knockPath))
 	}
 
 	if s.redisAddr == "" {

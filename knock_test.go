@@ -164,7 +164,15 @@ func TestConfigValidate(t *testing.T) {
 			c.RedisPoolSize = 2
 			c.LogClientIP = true
 			c.StaticAllowlist = []string{"10.0.0.1", "192.168.0.0/16", "2001:db8::/32"}
+			c.RedirectURL = "/welcome"
 		}},
+		{name: "redirect to root path", mutate: func(c *Config) { c.RedirectURL = "/" }},
+		{name: "redirect to same-origin path", mutate: func(c *Config) { c.RedirectURL = "/welcome" }},
+		{name: "redirect to absolute https url", mutate: func(c *Config) { c.RedirectURL = "https://example.com/welcome" }},
+		{name: "protocol-relative redirect", mutate: func(c *Config) { c.RedirectURL = "//evil.example/" }, wantErr: "protocol-relative"},
+		{name: "redirect with non-http scheme", mutate: func(c *Config) { c.RedirectURL = "javascript:alert(1)" }, wantErr: "absolute http(s)"},
+		{name: "redirect without scheme", mutate: func(c *Config) { c.RedirectURL = "example.com/welcome" }, wantErr: "absolute http(s)"},
+		{name: "redirect with backslash", mutate: func(c *Config) { c.RedirectURL = `/\evil.example/` }, wantErr: "backslash"},
 		{name: "static allowlist with a bad ip", mutate: func(c *Config) { c.StaticAllowlist = []string{"10.0.0.1", "not-an-ip"} }, wantErr: "staticAllowlist"},
 		{name: "static allowlist with a bad cidr", mutate: func(c *Config) { c.StaticAllowlist = []string{"10.0.0.0/33"} }, wantErr: "staticAllowlist"},
 		{name: "static allowlist with an empty entry", mutate: func(c *Config) { c.StaticAllowlist = []string{""} }, wantErr: "staticAllowlist"},
@@ -290,6 +298,80 @@ func TestKnockCustomPrefixAndTTL(t *testing.T) {
 	}
 	if !contains(srv.recordedCommands(), "SET custom:10.0.0.2 1 EX 2700") {
 		t.Fatalf("unexpected commands: %v", srv.recordedCommands())
+	}
+}
+
+func TestKnockRedirectsToConfiguredTarget(t *testing.T) {
+	handler, backend, srv := newHarness(t, func(c *Config) {
+		c.RedirectURL = "/"
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodGet, "https://example.com"+testKnockPath, "10.0.1.1:40000"))
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303 (body %q)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Location"); got != "/" {
+		t.Fatalf("Location = %q, want /", got)
+	}
+	if got := rec.Body.String(); got != "" {
+		t.Fatalf("303 response must have no body, got %q", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
+	}
+	if got := rec.Header().Get(knockTTLHeader); got != "2h0m0s" {
+		t.Fatalf("%s = %q, want 2h0m0s", knockTTLHeader, got)
+	}
+	if backend.callCount() != 0 {
+		t.Fatal("a knock redirect must not reach the backend")
+	}
+	if !srv.get("traefik:http-knock:10.0.1.1") {
+		t.Fatalf("expected the client IP to be stored, commands: %v", srv.recordedCommands())
+	}
+}
+
+func TestKnockRedirectsToAbsoluteURL(t *testing.T) {
+	const target = "https://example.com/welcome"
+
+	handler, backend, _ := newHarness(t, func(c *Config) {
+		c.RedirectURL = target
+	})
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodGet, "https://example.com"+testKnockPath, "10.0.1.2:40000"))
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status = %d, want 303", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != target {
+		t.Fatalf("Location = %q, want %q", got, target)
+	}
+	if backend.callCount() != 0 {
+		t.Fatal("a knock redirect must not reach the backend")
+	}
+}
+
+// TestKnockDoesNotRedirectWhenRedisFails proves the redirect is only sent
+// after the allowlist entry was actually stored: a failed knock stays a 503.
+func TestKnockDoesNotRedirectWhenRedisFails(t *testing.T) {
+	handler, backend, srv := newHarness(t, func(c *Config) {
+		c.RedirectURL = "/"
+	})
+	srv.failNext(1)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, newRequest(http.MethodGet, "https://example.com"+testKnockPath, "10.0.1.3:40000"))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 when the knock cannot be stored", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "" {
+		t.Fatalf("a failed knock must not redirect, Location = %q", got)
+	}
+	if backend.callCount() != 0 {
+		t.Fatal("a failed knock must not reach the backend")
 	}
 }
 

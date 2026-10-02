@@ -10,7 +10,9 @@ GET /__knock__/9c4e2e4e3b6d0c0f...64-hex-chars...
 ```
 
 When the request matches, the plugin stores the client IP in Redis with a TTL,
-answers `204 No Content` and never forwards the request to the backend. Every
+answers `204 No Content` (or redirects to a configured `redirectURL`, for
+example `/` for the homepage) and never forwards the request to the backend.
+Every
 other request is allowed only while that Redis key exists; otherwise the plugin
 answers `403 Forbidden`. Redis expires the key on its own, so the plugin keeps
 no in-memory state and starts no cleanup goroutines.
@@ -22,9 +24,9 @@ no in-memory state and starts no cleanup goroutines.
 - Fail closed by default: a Redis outage returns `503`, never `allow`
 
 Verified end to end against Traefik v3.2.5 (local plugin, Yaegi) and Redis 7.4:
-`403` before the knock, `204` + `Cache-Control: no-store` for a successful knock,
-`200` afterwards, `403` for non-GET requests (identical to any other path), and
-`503` while Redis was unreachable.
+`403` before the knock, `204` + `Cache-Control: no-store` for a successful knock
+(`303 See Other` when `redirectURL` is set), `200` afterwards, `403` for non-GET
+requests (identical to any other path), and `503` while Redis was unreachable.
 
 ```text
                    Internet
@@ -47,7 +49,7 @@ Verified end to end against Traefik v3.2.5 (local plugin, Yaegi) and Redis 7.4:
       Redis SETEX              |           |
           |                   YES          NO
           v                    |           |
-        204                    v           v
+     204/303                    v           v
                          Backend       HTTP 403
 ```
 
@@ -85,6 +87,7 @@ push somewhere else.)
 | `403` for non-allowlisted clients | implemented |
 | Non-GET requests handled like any other protected path (no path oracle) | implemented |
 | `204` + `Cache-Control: no-store` on successful knock | implemented |
+| Optional post-knock redirect (`redirectURL`, e.g. `/` for the homepage) | implemented |
 | Client IP from `RemoteAddr` or a configured header | implemented |
 | Static allowlist of IPs and CIDR ranges (always allowed) | implemented |
 | IPv4 and IPv6, canonicalized (`2001:0DB8::1` == `2001:db8::1`) | implemented |
@@ -115,7 +118,9 @@ secure and deployable.
    * resolve the client IP,
    * `SET <keyPrefix><clientIP> 1 EX <ttl>`,
    * success → `204 No Content`, `Cache-Control: no-store`, `X-Knock-TTL: 2h0m0s`,
-   * Redis error → `503 Service Unavailable`, regardless of `failClosed`,
+     or `303 See Other` + `Location: <redirectURL>` when `redirectURL` is set,
+   * Redis error → `503 Service Unavailable`, regardless of `failClosed`
+     (a failed knock never redirects),
    * the request is always terminated here and never reaches the backend.
 
 Only `GET` is a knock. Any other method (including `HEAD`) to the knock path is
@@ -168,6 +173,7 @@ allowlist their own IP until the TTL expires.
 | Status-code oracle on the secret path | Only `GET` is a knock; non-GET requests get the same `403` for the secret path and any other path, so no distinct status reveals a match |
 | Response caching by browsers/proxies | `Cache-Control: no-store` and `Pragma: no-cache` on knock responses |
 | Knock request reaching the backend | The middleware terminates the request itself and never calls `next` for a knock, including when `failClosed: false` |
+| Open redirect via `redirectURL` | Only same-origin absolute paths (starting with a single `/`) and absolute `http`/`https` URLs are accepted; `//host`, other schemes, control characters and backslashes (`/\evil` normalises to `//evil`) are rejected at config load |
 | Redis outage turning into an allow | Fail closed: `503`, never `next` for protected requests unless the operator explicitly sets `failClosed: false`. A knock is always terminated with `503` |
 | Header spoofing (`X-Forwarded-For` etc.) | Off by default (`RemoteAddr` is used). `clientIPHeader` must only be set when a trusted proxy overwrites it |
 | Static allowlist entries matching a spoofed client IP | Static entries match the resolved client IP, so they share the trust of `clientIPHeader`; keep it empty unless a trusted proxy overwrites it |
@@ -193,6 +199,13 @@ httpKnock:
   knockPath: "/__knock__/9c4e2e4e3b6d0c0f7b1a2c3d4e5f60718293a4b5c6d7e8f9"
   # Allowlist entry lifetime (Go duration). Redis expires the key.
   ttl: "2h"
+
+  # Optional. Where a browser is sent after a successful knock. Set it to "/"
+  # to land on the homepage (same origin), or to an absolute http(s) URL.
+  # Only paths starting with "/" and absolute http(s) URLs are accepted;
+  # "//host", other schemes and backslashes are rejected. Empty (default)
+  # keeps the plain 204 response.
+  redirectURL: ""
 
   # Required. "host:port" of Redis.
   redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
@@ -420,6 +433,8 @@ spec:
     httpKnock:
       knockPath: "/__knock__/REPLACE_WITH_64_HEX_CHARS"
       ttl: "2h"
+      # Optional: send the browser to the homepage after a successful knock.
+      redirectURL: "/"
       redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
       redisPassword: "REPLACE_WITH_REDIS_PASSWORD"
       keyPrefix: "traefik:http-knock:"
@@ -469,7 +484,7 @@ kubectl apply -f deploy/helmchartconfig.yaml
 # 4. Check
 kubectl -n kube-system logs deploy/traefik | grep -i plugin
 curl -i http://<node-ip>/                        # 403
-curl -i "http://<node-ip>/__knock__/$SECRET"     # 204
+curl -i "http://<node-ip>/__knock__/$SECRET"     # 204, or 303 when redirectURL is set
 curl -i http://<node-ip>/                        # 200
 ```
 
@@ -668,6 +683,7 @@ Verified live against **Traefik v3.2.5 + Redis 7.4** during development:
 | Protected request before any knock | `403` |
 | `POST` to the knock path | `403`, no Redis write, no backend call (same response as any other path) |
 | `GET` to the knock path | `204`, `Cache-Control: no-store`, `Pragma: no-cache`, `X-Knock-Ttl`, Redis key `1` with `TTL 7200` |
+| `GET` to the knock path with `redirectURL: /` | `303`, `Location: /`, same `Cache-Control`/`X-Knock-Ttl`, Redis key stored |
 | Protected request after the knock | `200`, backend reached |
 | Redis stopped | `503` for both knock and protected requests, no panic |
 | Redis `-NOPERM` on `SET` (server error) | `503`, connection reused, no panic |
@@ -686,6 +702,12 @@ HTTP/2 204
 cache-control: no-store
 pragma: no-cache
 x-knock-ttl: 2h0m0s
+
+# With redirectURL: "/" the same knock answers 303 and sends a browser to
+# the homepage, so the secret never stays in the address bar:
+$ curl -i https://example.com/__knock__/9c4e...f9
+HTTP/2 303
+location: /
 
 # 3. Access works until the TTL expires
 $ curl -i https://example.com/

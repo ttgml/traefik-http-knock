@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -62,6 +63,17 @@ type Config struct {
 	// TTL is the lifetime of an allowlist entry, expressed as a Go duration
 	// ("90s", "10m", "2h"). Redis expires the key automatically.
 	TTL string `json:"ttl,omitempty"`
+
+	// RedirectURL is where a browser is sent after a successful knock, so the
+	// visitor does not have to open the site manually. Set it to "/" to land on
+	// the homepage, or to any same-origin path ("https://example.com/" for an
+	// absolute URL).
+	//
+	// When empty (the default) a successful knock answers 204 No Content.
+	// Only absolute http(s) URLs and paths starting with "/" are accepted, so
+	// the middleware cannot be turned into an open redirect to javascript: or
+	// protocol-relative "//evil.example" targets.
+	RedirectURL string `json:"redirectURL,omitempty"`
 
 	// RedisAddr is the "host:port" of the Redis server.
 	RedisAddr string `json:"redisAddr,omitempty"`
@@ -158,6 +170,7 @@ type settings struct {
 	writeTimeout   time.Duration
 	redisPoolSize  int
 	logClientIP    bool
+	redirectURL    string
 	allowlist      *staticAllowlist
 }
 
@@ -249,6 +262,12 @@ func (c *Config) settings() (*settings, error) {
 		s.keyPrefix = DefaultKeyPrefix
 	}
 
+	redirectURL, err := parseRedirectURL(c.RedirectURL)
+	if err != nil {
+		return nil, err
+	}
+	s.redirectURL = redirectURL
+
 	allowlist, err := parseStaticAllowlist(c.StaticAllowlist)
 	if err != nil {
 		return nil, err
@@ -258,6 +277,42 @@ func (c *Config) settings() (*settings, error) {
 	s.failClosed = c.FailClosed == nil || *c.FailClosed
 
 	return s, nil
+}
+
+// parseRedirectURL validates the post-knock redirect target. An empty value
+// disables the redirect. Only absolute http(s) URLs and same-origin absolute
+// paths are accepted; protocol-relative ("//host") and non-HTTP schemes are
+// rejected so a misconfiguration cannot become an open redirect.
+func parseRedirectURL(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+
+	// Reject control characters and backslashes outright. Browsers normalise
+	// "\" to "/" for http(s) URLs, so "/\evil.example" would otherwise be
+	// parsed as the protocol-relative "//evil.example" and escape the origin.
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f || r == '\\' {
+			return "", fmt.Errorf("http-knock: redirectURL %q must not contain control characters or backslashes", value)
+		}
+	}
+
+	if strings.HasPrefix(value, "/") {
+		if strings.HasPrefix(value, "//") {
+			return "", fmt.Errorf("http-knock: redirectURL %q must not be protocol-relative; use an absolute http(s) URL", value)
+		}
+		return value, nil
+	}
+
+	u, err := url.Parse(value)
+	if err != nil {
+		return "", fmt.Errorf("http-knock: redirectURL %q is not a valid URL: %w", value, err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", fmt.Errorf("http-knock: redirectURL %q must be an absolute http(s) URL or a path starting with %q", value, "/")
+	}
+	return value, nil
 }
 
 // parseDuration parses a Go duration string. An empty value falls back to the
@@ -401,6 +456,15 @@ func (m *middleware) handleKnock(rw http.ResponseWriter, req *http.Request) {
 	rw.Header().Set("Cache-Control", "no-store")
 	rw.Header().Set("Pragma", "no-cache")
 	rw.Header().Set(knockTTLHeader, m.cfg.ttl.String())
+
+	if m.cfg.redirectURL != "" {
+		// 303 makes the client switch to a GET for the target, which is the
+		// expected behaviour after the side effect of a knock.
+		rw.Header().Set("Location", m.cfg.redirectURL)
+		rw.WriteHeader(http.StatusSeeOther)
+		return
+	}
+
 	rw.WriteHeader(http.StatusNoContent)
 }
 

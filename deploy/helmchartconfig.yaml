@@ -24,7 +24,7 @@ spec:
     # ---------------------------------------------------------------- Option A
     image:
       repository: ghcr.io/ttgml/traefik-http-knock
-      tag: v0.1.1
+      tag: v0.2.0
       pullPolicy: IfNotPresent
     additionalArguments:
       - "--experimental.localPlugins.httpKnock.moduleName=github.com/ttgml/traefik-http-knock"

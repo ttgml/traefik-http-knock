@@ -194,3 +194,24 @@ func (a *staticAllowlist) contains(clientIP string) bool {
 	}
 	return false
 }
+
+// scopedKey builds a Redis key inside a middleware realm. The realm prevents a
+// knock on one middleware from granting access to another middleware that
+// shares the same Redis database and keyPrefix.
+func scopedKey(prefix, realm, kind, id string) string {
+	return prefix + realm + ":" + kind + ":" + id
+}
+
+// ipGrantKey is the Redis key for an IP allowlist entry. The IP is normalized
+// before it reaches this function, so different spellings of the same IPv6
+// address cannot create separate entries.
+func ipGrantKey(prefix, realm, ip string) string {
+	return scopedKey(prefix, realm, "ip", ip)
+}
+
+// sessionRedisKey stores a session by the SHA-256 of its random id. The raw
+// session id is never written to Redis, so a Redis dump cannot be replayed as
+// a valid cookie/token.
+func sessionRedisKey(prefix, realm, sessionID string) string {
+	return scopedKey(prefix, realm, "session", sha256Hex(sessionID))
+}

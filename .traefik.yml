@@ -1,7 +1,7 @@
 displayName: HTTP Knock
 type: middleware
 import: github.com/ttgml/traefik-http-knock
-summary: 'Temporary IP allowlist based on HTTP knock requests, backed by Redis TTLs.'
+summary: 'Path, password and Basic authentication with Redis-backed IP/session grants.'
 testData:
   knockPath: "/__knock__/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   ttl: "2h"
@@ -13,3 +13,11 @@ testData:
   readTimeout: "1s"
   writeTimeout: "1s"
   redisPoolSize: 16
+  authMode: "path"
+  grantMode: "ip"
+  cookieSecure: true
+  cookieSameSite: "Lax"
+  maxLoginAttempts: 5
+  loginWindow: "15m"
+  maxConcurrentLogins: 4
+  privateResponses: false

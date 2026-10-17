@@ -17,6 +17,9 @@ import (
 // only exists in tests.
 const testKnockPath = "/__knock__/0123456789abcdef0123456789abcdef"
 
+// testKey is the realm-scoped Redis key used by the test harness (name "test").
+func testKey(ip string) string { return ipGrantKey(DefaultKeyPrefix, "test", ip) }
+
 // recordingBackend captures how the plugin called the wrapped handler.
 type recordingBackend struct {
 	mu      sync.Mutex
@@ -276,10 +279,10 @@ func TestKnockStoresClientIP(t *testing.T) {
 	if backend.callCount() != 0 {
 		t.Fatal("the knock request must never reach the backend")
 	}
-	if !srv.get("traefik:http-knock:10.0.0.1") {
+	if !srv.get(testKey("10.0.0.1")) {
 		t.Fatalf("expected the client IP to be stored, commands: %v", srv.recordedCommands())
 	}
-	if !contains(srv.recordedCommands(), "SET traefik:http-knock:10.0.0.1 1 EX 7200") {
+	if !contains(srv.recordedCommands(), "SET "+testKey("10.0.0.1")+" 1 EX 7200") {
 		t.Fatalf("unexpected commands: %v", srv.recordedCommands())
 	}
 }
@@ -299,7 +302,7 @@ func TestKnockCustomPrefixAndTTL(t *testing.T) {
 	if got := rec.Header().Get(knockTTLHeader); got != "45m0s" {
 		t.Fatalf("%s = %q, want 45m0s", knockTTLHeader, got)
 	}
-	if !contains(srv.recordedCommands(), "SET custom:10.0.0.2 1 EX 2700") {
+	if !contains(srv.recordedCommands(), "SET custom:test:ip:10.0.0.2 1 EX 2700") {
 		t.Fatalf("unexpected commands: %v", srv.recordedCommands())
 	}
 }
@@ -330,7 +333,7 @@ func TestKnockRedirectsToConfiguredTarget(t *testing.T) {
 	if backend.callCount() != 0 {
 		t.Fatal("a knock redirect must not reach the backend")
 	}
-	if !srv.get("traefik:http-knock:10.0.1.1") {
+	if !srv.get(testKey("10.0.1.1")) {
 		t.Fatalf("expected the client IP to be stored, commands: %v", srv.recordedCommands())
 	}
 }
@@ -423,7 +426,7 @@ func TestNonGetKnockIsNotASpecialCase(t *testing.T) {
 			if backend.callCount() != 0 {
 				t.Fatal("a non-GET request to the knock path must not reach the backend")
 			}
-			if srv.get("traefik:http-knock:10.0.0.4") {
+			if srv.get(testKey("10.0.0.4")) {
 				t.Fatal("a non-GET request must not knock")
 			}
 		})
@@ -479,7 +482,7 @@ func TestKnockPathMustMatchExactly(t *testing.T) {
 			if backend.callCount() != 0 {
 				t.Fatal("an unauthorized request must not reach the backend")
 			}
-			if srv.get("traefik:http-knock:10.0.0.5") {
+			if srv.get(testKey("10.0.0.5")) {
 				t.Fatal("a non-matching path must not knock")
 			}
 		})
@@ -664,7 +667,7 @@ func TestKnockIPv6Client(t *testing.T) {
 	if knock.Code != http.StatusNoContent {
 		t.Fatalf("knock status = %d, want 204", knock.Code)
 	}
-	if !srv.get("traefik:http-knock:2001:db8::5") {
+	if !srv.get(testKey("2001:db8::5")) {
 		t.Fatalf("expected a canonicalized IPv6 key, commands: %v", srv.recordedCommands())
 	}
 
@@ -699,7 +702,7 @@ func TestClientIPHeaderIsUsedWhenConfigured(t *testing.T) {
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("knock status = %d, want 204", rec.Code)
 	}
-	if !srv.get("traefik:http-knock:203.0.113.5") {
+	if !srv.get(testKey("203.0.113.5")) {
 		t.Fatalf("expected the left-most X-Forwarded-For entry, commands: %v", srv.recordedCommands())
 	}
 

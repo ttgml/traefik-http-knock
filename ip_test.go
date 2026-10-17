@@ -203,22 +203,23 @@ func TestFirstForwardedFor(t *testing.T) {
 	}
 }
 
-func TestRedisKey(t *testing.T) {
+func TestIPGrantKey(t *testing.T) {
 	tests := []struct {
 		name   string
 		prefix string
+		realm  string
 		ip     string
 		want   string
 	}{
-		{name: "ipv4", prefix: "traefik:http-knock:", ip: "192.168.1.10", want: "traefik:http-knock:192.168.1.10"},
-		{name: "ipv6", prefix: "traefik:http-knock:", ip: "2001:db8::1", want: "traefik:http-knock:2001:db8::1"},
-		{name: "custom prefix", prefix: "knock:", ip: "10.0.0.1", want: "knock:10.0.0.1"},
-		{name: "v4 and v6 never collide", prefix: "k:", ip: "::1", want: "k:::1"},
+		{name: "ipv4", prefix: "traefik:http-knock:", realm: "app", ip: "192.168.1.10", want: "traefik:http-knock:app:ip:192.168.1.10"},
+		{name: "ipv6", prefix: "traefik:http-knock:", realm: "app", ip: "2001:db8::1", want: "traefik:http-knock:app:ip:2001:db8::1"},
+		{name: "custom prefix", prefix: "knock:", realm: "app", ip: "10.0.0.1", want: "knock:app:ip:10.0.0.1"},
+		{name: "v4 and v6 never collide", prefix: "k:", realm: "app", ip: "::1", want: "k:app:ip:::1"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := redisKey(tt.prefix, tt.ip); got != tt.want {
-				t.Fatalf("redisKey(%q, %q) = %q, want %q", tt.prefix, tt.ip, got, tt.want)
+			if got := ipGrantKey(tt.prefix, tt.realm, tt.ip); got != tt.want {
+				t.Fatalf("ipGrantKey(%q, %q, %q) = %q, want %q", tt.prefix, tt.realm, tt.ip, got, tt.want)
 			}
 		})
 	}

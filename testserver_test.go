@@ -18,13 +18,18 @@ import (
 //
 // It also records every command it received so tests can assert on protocol
 // details such as the exact SET ... EX arguments.
+type fakeRedisValue struct {
+	value  string
+	expiry time.Time // zero value means no expiry
+}
+
 type fakeRedisServer struct {
 	t  *testing.T
 	ln net.Listener
 
 	mu sync.Mutex
 
-	values map[string]time.Time // key -> expiry (zero value means no expiry)
+	values map[string]fakeRedisValue
 
 	password   string
 	username   string
@@ -64,7 +69,7 @@ func startFakeRedis(t *testing.T, opts ...fakeRedisOptions) *fakeRedisServer {
 	srv := &fakeRedisServer{
 		t:      t,
 		ln:     ln,
-		values: make(map[string]time.Time),
+		values: make(map[string]fakeRedisValue),
 		active: make(map[net.Conn]struct{}),
 	}
 	if len(opts) > 0 {
@@ -250,14 +255,50 @@ func (s *fakeRedisServer) handle(conn net.Conn) {
 					continue
 				}
 			}
-			s.set(args[1], expiry)
+			s.set(args[1], args[2], expiry)
 			_ = writeSimple(w, "OK")
 
 		case "GET":
-			if s.get(args[1]) {
-				_ = writeBulk(w, "1")
+			if value, ok := s.getValue(args[1]); ok {
+				_ = writeBulk(w, value)
 			} else {
 				_ = writeNil(w)
+			}
+
+		case "INCR":
+			if !authed {
+				_ = writeError(w, "NOAUTH Authentication required.")
+				continue
+			}
+			if len(args) != 2 {
+				_ = writeError(w, "ERR wrong number of arguments for 'incr' command")
+				continue
+			}
+			n, err := s.incr(args[1])
+			if err != nil {
+				_ = writeError(w, "ERR value is not an integer or out of range")
+				continue
+			}
+			_ = writeInteger(w, n)
+
+		case "EXPIRE":
+			if !authed {
+				_ = writeError(w, "NOAUTH Authentication required.")
+				continue
+			}
+			if len(args) != 3 {
+				_ = writeError(w, "ERR wrong number of arguments for 'expire' command")
+				continue
+			}
+			seconds, err := strconv.Atoi(args[2])
+			if err != nil {
+				_ = writeError(w, "ERR value is not an integer or out of range")
+				continue
+			}
+			if s.expire(args[1], time.Duration(seconds)*time.Second) {
+				_ = writeInteger(w, 1)
+			} else {
+				_ = writeInteger(w, 0)
 			}
 
 		case "DEL":
@@ -271,8 +312,8 @@ func (s *fakeRedisServer) handle(conn net.Conn) {
 
 		case "TTL":
 			s.mu.Lock()
-			expiry, ok := s.values[args[1]]
-			if ok && !expiry.IsZero() && time.Now().After(expiry) {
+			item, ok := s.values[args[1]]
+			if ok && !item.expiry.IsZero() && time.Now().After(item.expiry) {
 				delete(s.values, args[1])
 				ok = false
 			}
@@ -280,10 +321,10 @@ func (s *fakeRedisServer) handle(conn net.Conn) {
 			switch {
 			case !ok:
 				_ = writeInteger(w, -2)
-			case expiry.IsZero():
+			case item.expiry.IsZero():
 				_ = writeInteger(w, -1)
 			default:
-				_ = writeInteger(w, int64(time.Until(expiry).Seconds()))
+				_ = writeInteger(w, int64(time.Until(item.expiry).Seconds()))
 			}
 
 		default:
@@ -293,23 +334,65 @@ func (s *fakeRedisServer) handle(conn net.Conn) {
 }
 
 func (s *fakeRedisServer) get(key string) bool {
+	_, ok := s.getValue(key)
+	return ok
+}
+
+func (s *fakeRedisServer) getValue(key string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	expiry, ok := s.values[key]
+	item, ok := s.values[key]
+	if !ok {
+		return "", false
+	}
+	if !item.expiry.IsZero() && time.Now().After(item.expiry) {
+		delete(s.values, key)
+		return "", false
+	}
+	return item.value, true
+}
+
+func (s *fakeRedisServer) set(key, value string, expiry time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.values[key] = fakeRedisValue{value: value, expiry: expiry}
+}
+
+func (s *fakeRedisServer) incr(key string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.values[key]
+	if ok && !item.expiry.IsZero() && time.Now().After(item.expiry) {
+		delete(s.values, key)
+		ok = false
+	}
+	n := int64(0)
+	if ok {
+		parsed, err := strconv.ParseInt(item.value, 10, 64)
+		if err != nil {
+			return 0, err
+		}
+		n = parsed
+	}
+	n++
+	s.values[key] = fakeRedisValue{value: strconv.FormatInt(n, 10), expiry: item.expiry}
+	return n, nil
+}
+
+func (s *fakeRedisServer) expire(key string, ttl time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	item, ok := s.values[key]
 	if !ok {
 		return false
 	}
-	if !expiry.IsZero() && time.Now().After(expiry) {
+	if !item.expiry.IsZero() && time.Now().After(item.expiry) {
 		delete(s.values, key)
 		return false
 	}
+	item.expiry = time.Now().Add(ttl)
+	s.values[key] = item
 	return true
-}
-
-func (s *fakeRedisServer) set(key string, expiry time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.values[key] = expiry
 }
 
 func (s *fakeRedisServer) del(key string) bool {
@@ -326,7 +409,7 @@ func (s *fakeRedisServer) del(key string) bool {
 func (s *fakeRedisServer) expireAll() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.values = make(map[string]time.Time)
+	s.values = make(map[string]fakeRedisValue)
 }
 
 func (s *fakeRedisServer) recordedCommands() []string {

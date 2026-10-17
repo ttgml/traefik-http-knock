@@ -54,7 +54,7 @@ func TestRedisSetExAndExists(t *testing.T) {
 	srv := startFakeRedis(t)
 	client := newTestRedisClient(t, srv.addr())
 
-	key := redisKey(DefaultKeyPrefix, "192.168.1.10")
+	key := ipGrantKey(DefaultKeyPrefix, "test", "192.168.1.10")
 
 	allowed, err := client.exists(key)
 	if err != nil {
@@ -76,7 +76,7 @@ func TestRedisSetExAndExists(t *testing.T) {
 		t.Fatal("key must exist after the knock")
 	}
 
-	want := "SET traefik:http-knock:192.168.1.10 1 EX 7200"
+	want := "SET traefik:http-knock:test:ip:192.168.1.10 1 EX 7200"
 	if got := srv.recordedCommands(); !contains(got, want) {
 		t.Fatalf("expected command %q, got %v", want, got)
 	}
@@ -86,12 +86,12 @@ func TestRedisKeyForIPv6IsUnambiguous(t *testing.T) {
 	srv := startFakeRedis(t)
 	client := newTestRedisClient(t, srv.addr())
 
-	key := redisKey(DefaultKeyPrefix, "2001:db8::1")
+	key := ipGrantKey(DefaultKeyPrefix, "test", "2001:db8::1")
 	if err := client.setEx(key, "1", time.Minute); err != nil {
 		t.Fatalf("setEx: %v", err)
 	}
 
-	want := "SET traefik:http-knock:2001:db8::1 1 EX 60"
+	want := "SET traefik:http-knock:test:ip:2001:db8::1 1 EX 60"
 	if got := srv.recordedCommands(); !contains(got, want) {
 		t.Fatalf("expected command %q, got %v", want, got)
 	}
@@ -323,7 +323,7 @@ func TestRedisIntegrationTTL(t *testing.T) {
 	client := newRedisClient(opts)
 	defer func() { _ = client.Close() }()
 
-	key := redisKey("traefik:http-knock:itest:", "203.0.113.7")
+	key := ipGrantKey("traefik:http-knock:itest:", "itest", "203.0.113.7")
 	if _, err := client.do("DEL", key); err != nil {
 		t.Fatalf("del before knock: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestRedisConcurrentStress(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			key := redisKey(DefaultKeyPrefix, "10.0.0."+strconv.Itoa(i))
+			key := ipGrantKey(DefaultKeyPrefix, "test", "10.0.0."+strconv.Itoa(i))
 			for j := 0; j < 25; j++ {
 				if err := client.setEx(key, "1", time.Minute); err != nil {
 					t.Errorf("setEx: %v", err)
@@ -664,5 +664,60 @@ func TestRedisDescribeKind(t *testing.T) {
 				t.Fatalf("describeKind() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRedisGetIncrExpireAndDel(t *testing.T) {
+	srv := startFakeRedis(t)
+	client := newTestRedisClient(t, srv.addr())
+
+	key := "test:counter"
+	if _, ok, err := client.getValue(key); err != nil || ok {
+		t.Fatalf("getValue missing key = %v, %v; want false, nil", ok, err)
+	}
+
+	n, err := client.incr(key)
+	if err != nil {
+		t.Fatalf("incr: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("first incr = %d, want 1", n)
+	}
+	n, err = client.incr(key)
+	if err != nil {
+		t.Fatalf("second incr: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("second incr = %d, want 2", n)
+	}
+	if value, ok, err := client.getValue(key); err != nil || !ok || value != "2" {
+		t.Fatalf("getValue = %q, %v, %v; want 2, true, nil", value, ok, err)
+	}
+
+	if err := client.expire(key, time.Minute); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if err := client.del(key); err != nil {
+		t.Fatalf("del: %v", err)
+	}
+	if _, ok, err := client.getValue(key); err != nil || ok {
+		t.Fatalf("getValue after del = %v, %v; want false, nil", ok, err)
+	}
+}
+
+func TestRedisSetExStoresArbitraryValue(t *testing.T) {
+	srv := startFakeRedis(t)
+	client := newTestRedisClient(t, srv.addr())
+
+	key := ipGrantKey(DefaultKeyPrefix, "test", "10.0.0.1")
+	if err := client.setEx(key, "alice|fingerprint", time.Hour); err != nil {
+		t.Fatalf("setEx: %v", err)
+	}
+	value, ok, err := client.getValue(key)
+	if err != nil || !ok {
+		t.Fatalf("getValue = %v, %v; want true, nil", ok, err)
+	}
+	if value != "alice|fingerprint" {
+		t.Fatalf("value = %q, want alice|fingerprint", value)
 	}
 }

@@ -2,8 +2,8 @@
 MODULE              ?= github.com/ttgml/traefik-http-knock
 TRAEFIK_VERSION     ?= v3.2
 IMAGE               ?= ghcr.io/ttgml/traefik-http-knock
-TAG                 ?= v0.1.1
-PLUGIN_VERSION      ?= v0.1.1
+TAG                 ?= v0.2.0
+PLUGIN_VERSION      ?= v0.2.0
 # The plugin ConfigMap must live in the same namespace as the Traefik pod.
 K8S_NAMESPACE       ?= kube-system
 PLUGIN_CONFIGMAP    ?= http-knock-plugin
@@ -11,7 +11,7 @@ REDIS_IMAGE         ?= redis:7.4-alpine
 REDIS_PASSWORD      ?= devpassword
 GO                  ?= go
 
-PLUGIN_SOURCES = go.mod .traefik.yml knock.go ip.go redis.go
+PLUGIN_SOURCES = go.mod .traefik.yml knock.go ip.go redis.go auth.go crypto.go ratelimit.go response.go
 
 .PHONY: help
 help:
@@ -23,6 +23,7 @@ help:
 	@echo "  redis-up redis-down          throwaway Redis for the integration test"
 	@echo "  test-integration             Redis integration test (needs redis-up)"
 	@echo "  k8s-plugin-configmap         generate deploy/plugin-configmap.yaml"
+	@echo "  hash-password                generate a PBKDF2 password hash"
 	@echo "  release                      checks + annotated git tag TAG"
 
 .PHONY: fmt
@@ -94,9 +95,17 @@ k8s-plugin-configmap:
 		--from-file=knock.go \
 		--from-file=ip.go \
 		--from-file=redis.go \
+		--from-file=auth.go \
+		--from-file=crypto.go \
+		--from-file=ratelimit.go \
+		--from-file=response.go \
 		--dry-run=client -o yaml \
 		> deploy/plugin-configmap.yaml
 	@echo "wrote deploy/plugin-configmap.yaml (namespace $(K8S_NAMESPACE))"
+
+.PHONY: hash-password
+hash-password:
+	$(GO) run ./cmd/knockhash
 
 .PHONY: release
 release: check

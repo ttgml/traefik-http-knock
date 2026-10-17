@@ -1,32 +1,58 @@
 # traefik-http-knock
 
 `traefik-http-knock` is a Traefik v3 middleware plugin that keeps a website
-closed to everyone except clients that first performed a secret **HTTP knock**.
+closed to everyone except clients that authenticate first.
 
-A knock is a request to a private path, for example:
+It supports three authentication modes:
 
-```
-GET /__knock__/9c4e2e4e3b6d0c0f...64-hex-chars...
-```
+* **path** (the original mode): `GET /__knock__/<secret>` is the credential.
+* **password**: a login form verifies one or more usernames/passwords and issues
+  a Redis-backed session cookie; CLI/API clients can use HTTP Basic
+  (`authMode: basic`) or exchange credentials for a Bearer session token.
+* **basic**: HTTP Basic authentication on every request, without Redis state.
 
-When the request matches, the plugin stores the client IP in Redis with a TTL,
-answers `204 No Content` (or redirects to a configured `redirectURL`, for
-example `/` for the homepage) and never forwards the request to the backend.
-Every
-other request is allowed only while that Redis key exists; otherwise the plugin
-answers `403 Forbidden`. Redis expires the key on its own, so the plugin keeps
-no in-memory state and starts no cleanup goroutines.
+A successful password login can grant access in three ways:
+
+* `grantMode: session` (default for password mode): a session cookie/token,
+  revocable with logout and stored in Redis.
+* `grantMode: ip`: the original per-IP Redis allowlist.
+* `grantMode: both`: either grant allows the request.
+
+Every grant is scoped to a **realm** (default: the Traefik middleware name), so
+two middlewares sharing a Redis database cannot accidentally grant access to
+each other. Password sessions are always validated against Redis: when Redis is
+unavailable, a password cookie/token is unusable, even with
+`failClosed: false`.
 
 - Traefik v3 middleware plugin (`CreateConfig`, `New`, `ServeHTTP`)
 - Go standard library only, no third-party dependencies (Yaegi friendly)
-- Minimal RESP client: `AUTH`, `SELECT`, `PING`, `EXISTS`, `SET ... EX`
+- Minimal RESP client: `AUTH`, `SELECT`, `PING`, `EXISTS`, `GET`, `SET ... EX`,
+  `INCR`, `EXPIRE`, `DEL`
 - Bounded Redis connection pool with dial/read/write timeouts
 - Fail closed by default: a Redis outage returns `503`, never `allow`
+- Multiple password users, PBKDF2-HMAC-SHA256 hashes, credentials file/env
+- Redis-backed sessions with logout and password-change revocation
+- HTTP Basic and Bearer session tokens for CLI/API clients
+- Per-IP login rate limiting and bounded concurrent password verification
+- Realm-scoped Redis keys and cookies
+- CDN-safe protected responses (`Cache-Control: private`, `Vary`)
 
-Verified end to end against Traefik v3.2.5 (local plugin, Yaegi) and Redis 7.4:
-`403` before the knock, `204` + `Cache-Control: no-store` for a successful knock
-(`303 See Other` when `redirectURL` is set), `200` afterwards, `403` for non-GET
-requests (identical to any other path), and `503` while Redis was unreachable.
+Path mode was verified end to end against Traefik v3.2.5 (local plugin, Yaegi)
+and Redis 7.4: `403` before the knock, `204` + `Cache-Control: no-store` for a
+successful knock (`303 See Other` when `redirectURL` is set), `200` afterwards,
+`403` for non-GET requests (identical to any other path), and `503` while Redis
+was unreachable.
+
+Password mode was also verified end to end against Traefik v3.2.5 + Redis 7.4:
+`403` before login, `303` + session cookie on login, `200` on the protected
+route, `303` on logout, and `403` afterwards; the JSON login returned a Bearer
+token that produced `200`, and protected responses carried
+`Cache-Control: private` / `Vary: Cookie, Authorization`. PBKDF2/HMAC/session
+behavior was additionally exercised directly under Yaegi v0.16.1.
+
+Path mode (the default):
+
+```text
 
 ```text
                    Internet
@@ -60,8 +86,8 @@ requests (identical to any other path), and `503` while Redis was unreachable.
 The module path is **`github.com/ttgml/traefik-http-knock`** and is already
 consistent everywhere: `go.mod`, `.traefik.yml`, `Dockerfile`, `Makefile`,
 `.github/workflows/ci.yml`, `docker-compose.yml`,
-`deploy/helmchartconfig.yaml`, `deploy/traefik-static-config.yml` and
-`deploy/traefik-compose.yml`.
+`deploy/helmchartconfig.yaml`, `deploy/traefik-static-config.yml`,
+`deploy/traefik-compose.yml` and `cmd/knockhash/main.go`.
 
 Traefik requires the module path to match the repository path, the local plugin
 directory (`/plugins-local/src/<module>`) and the catalog `import`, so if you
@@ -83,74 +109,133 @@ push somewhere else.)
 | Feature | Status |
 | --- | --- |
 | Secret path knock (`GET /__knock__/<secret>`) | implemented |
+| Password login form + session cookie | implemented |
+| Multiple users/passwords, PBKDF2 hashes | implemented |
+| Credentials file/environment, cookie-secret file/environment | implemented |
+| HTTP Basic auth (`authMode: basic`) | implemented |
+| Bearer session token for CLI/API (`Accept: application/json`) | implemented |
+| Logout (`POST` + `action=logout`) and password-change revocation | implemented |
+| Login rate limiting per IP and bounded concurrent KDFs | implemented |
+| Redis session store with TTL and hashed session keys | implemented |
+| Realm-scoped Redis keys and signed tokens | implemented |
+| CDN-safe `Cache-Control: private` / `Vary` on protected responses | implemented |
 | Redis TTL allowlist (state store only, no Go timers) | implemented |
-| `403` for non-allowlisted clients | implemented |
-| Non-GET requests handled like any other protected path (no path oracle) | implemented |
-| `204` + `Cache-Control: no-store` on successful knock | implemented |
-| Optional post-knock redirect (`redirectURL`, e.g. `/` for the homepage) | implemented |
+| Non-GET requests to the path endpoint are not a path oracle | implemented |
+| `204`/`303` + `Cache-Control: no-store` on successful authentication | implemented |
+| Optional post-authentication redirect (`redirectURL`) | implemented |
 | Client IP from `RemoteAddr` or a configured header | implemented |
 | Static allowlist of IPs and CIDR ranges (always allowed) | implemented |
 | IPv4 and IPv6, canonicalized (`2001:0DB8::1` == `2001:db8::1`) | implemented |
 | Fail closed on Redis errors (`503`) | implemented |
 | Bounded connection pool, timeouts, connection reuse | implemented |
-| Constant-time secret path comparison | implemented |
+| Constant-time secret/password/hash comparison | implemented |
 | Client IP logging toggle (`logClientIP`, off by default) | implemented |
-| HMAC token knock (`?token=timestamp.nonce.signature`) | **planned**, extension point in place |
-| Knock rate limiting / brute-force protection | **planned** |
+| Optional authenticated-user header to the backend | implemented |
 
-Version 1 deliberately implements only what is needed to be correct, stable,
-secure and deployable.
+The implementation stays standard-library only so it remains loadable by
+Traefik's Yaegi interpreter. Password and session support add no external
+dependencies.
 
 ## 2. How it works
 
-1. Traefik routes the request to the middleware (`Middleware` CRD or labels).
-2. If the request is **not** a `GET` whose `req.URL.Path` is (constant-time) equal
-   to `knockPath`, the request is a **protected request**:
-   * resolve the client IP,
-   * client IP on the static allowlist → `next.ServeHTTP()` (no Redis call, so
-     this keeps working during a Redis outage),
-   * otherwise `EXISTS <keyPrefix><clientIP>` in Redis,
-   * key present → `next.ServeHTTP()` (the backend is reached),
-   * key absent → `403 Forbidden`,
-   * Redis error → `503 Service Unavailable` (fail closed), or `next.ServeHTTP()`
-     when the operator explicitly set `failClosed: false`.
-3. If the request is a `GET` whose path matches, it is a **knock**:
-   * resolve the client IP,
-   * `SET <keyPrefix><clientIP> 1 EX <ttl>`,
-   * success → `204 No Content`, `Cache-Control: no-store`, `X-Knock-TTL: 2h0m0s`,
-     or `303 See Other` + `Location: <redirectURL>` when `redirectURL` is set,
-   * Redis error → `503 Service Unavailable`, regardless of `failClosed`
-     (a failed knock never redirects),
-   * the request is always terminated here and never reaches the backend.
+### 2.1 Authentication modes
 
-Only `GET` is a knock. Any other method (including `HEAD`) to the knock path is
-handled exactly like a request to any other protected path and answers `403`
-unless the client is already allowlisted, so it cannot be used to confirm a
-guessed secret path.
+`authMode` selects how a request proves that it is allowed to continue. Only one
+mode is active per middleware instance; path and password knocks are not
+combined in the same instance.
 
-The middleware never modifies the request (method, host, URL, authorization,
-cookies, headers, body) nor the backend response. It only answers
-allow / deny / knock.
+**`path` (default, backward compatible)**
+
+1. `GET <knockPath>` is the credential.
+2. The client IP is stored in Redis with a TTL.
+3. Protected requests are allowed while the IP key exists.
+4. Non-GET requests to the secret path are handled like any other protected
+   request, so they do not reveal that the path matched.
+
+**`password`**
+
+1. `GET <loginPath>` renders a small login form. `loginPath` defaults to
+   `knockPath`.
+2. `POST <loginPath>` verifies `username` and `password` against one or more
+   configured users.
+3. On success, the configured `grantMode` decides what is issued:
+   * `session` (default): a Redis-backed session cookie is set. The same
+     session token can be used as `Authorization: Bearer <token>` for API
+     clients.
+   * `ip`: the client IP is stored in Redis, as in path mode.
+   * `both`: both grants are issued; either one allows the request.
+4. `POST <loginPath>` with `action=logout` deletes the Redis session and the IP
+   grant (when applicable), and clears the cookie.
+5. JSON clients can send `Accept: application/json` (or `?format=token`) to
+   receive:
+
+```json
+{"ok":true,"username":"alice","token":"v1....","expiresIn":43200}
+```
+
+6. Changing a user's password changes the credential fingerprint stored in the
+   session value. Existing sessions for that user are then rejected and
+   deleted on their next use.
+
+**`basic`**
+
+HTTP Basic credentials are verified on every request. This mode is stateless
+and does not use Redis for access decisions. It is intended for CLI/API clients;
+browsers will show a native credential dialog and have no logout button.
+
+### 2.2 Protected request flow
+
+1. Resolve the client IP from `RemoteAddr` or `clientIPHeader`.
+2. If the IP is on `staticAllowlist`, forward the request immediately. Static
+   entries do not need Redis, so they keep working during a Redis outage.
+3. Otherwise, depending on the mode:
+   * **path**: check `EXISTS <prefix><realm>:ip:<clientIP>`.
+   * **password**: check a Bearer token, then the session cookie, then
+     (for `grantMode: ip`/`both`) the IP key.
+   * **basic**: verify the `Authorization: Basic` header.
+4. On success call `next.ServeHTTP()`. Otherwise return `401` (Basic/Bearer
+   challenge), `403` (no grant), or `429` (login rate limit).
+
+Session lookups always fail closed: if Redis is unavailable, a password session
+cookie/token is unusable even when `failClosed: false`. This prevents a Redis
+outage from silently turning a password session into a fail-open bypass.
+
+By default, protected responses in password/basic mode are marked
+`Cache-Control: private` and `Vary: Cookie, Authorization`, so a CDN cannot
+cache an authenticated response and serve it to another client. Set
+`privateResponses: false` only if you have another cache-isolation mechanism.
+
+The plugin never forwards an authentication endpoint request to the backend.
+Password fields, session cookies and bearer tokens are not written to logs.
 
 ## 3. Redis data model
 
+All keys are realm-scoped. `realm` defaults to the Traefik middleware name.
+
 | Key | Value | TTL |
 | --- | --- | --- |
-| `<keyPrefix><clientIP>` | `1` | configured `ttl` |
+| `<keyPrefix><realm>:ip:<clientIP>` | `1` | `ttl` |
+| `<keyPrefix><realm>:session:<sha256(sessionID)>` | `<username>|<credential-fingerprint>` | `sessionTTL` |
+| `<keyPrefix><realm>:login:<clientIP>` | failed-attempt counter | `loginWindow` |
 
 Examples:
 
 ```text
-traefik:http-knock:192.168.1.10       -> 1  (EX 7200)
-traefik:http-knock:2001:db8::1        -> 1  (EX 7200)
+traefik:http-knock:app-a:ip:192.168.1.10       -> 1
+traefik:http-knock:app-a:ip:2001:db8::1        -> 1
+traefik:http-knock:app-a:session:59c4...       -> alice|8f2a...
+traefik:http-knock:app-a:login:203.0.113.5     -> 2
 ```
 
 * The IP is normalized (`net.ParseIP(...).String()`) before the key is built, so
   different spellings of the same IPv6 address cannot create two entries.
-* The IP is validated before use, so a client cannot inject arbitrary bytes or
-  a `keyPrefix` break into the Redis key.
-* The value is irrelevant: only `EXISTS` matters. TTL expiry is the only
-  removal mechanism (there is no `DEL` in the request path).
+* The raw session id is never stored in Redis; only its SHA-256 is used as key
+  material. A Redis dump cannot be replayed as a valid cookie/token.
+* The session value contains the username and a fingerprint of the current
+  password hash. Changing the password or removing the user invalidates the
+  session on its next use.
+* Login counters are incremented with `INCR`; `INCR` is never retried
+  automatically because it is not idempotent.
 
 Inspect state manually:
 
@@ -158,39 +243,51 @@ Inspect state manually:
 kubectl -n traefik-http-knock exec deploy/redis -- \
   redis-cli -a "$REDIS_PASSWORD" --scan --pattern 'traefik:http-knock:*'
 kubectl -n traefik-http-knock exec deploy/redis -- \
-  redis-cli -a "$REDIS_PASSWORD" TTL traefik:http-knock:203.0.113.5
+  redis-cli -a "$REDIS_PASSWORD" TTL traefik:http-knock:app-a:ip:203.0.113.5
 ```
 
 ## 4. Security model
 
-The plugin is a **temporary IP allowlist**: whoever knows the knock path can
-allowlist their own IP until the TTL expires.
+The plugin is an authentication and temporary-grant layer, not a full identity
+provider. The shared password is the credential; anyone who knows it can log
+in. Use per-user passwords and rotate them when someone leaves.
 
 | Risk | Mitigation |
 | --- | --- |
-| Guessable knock path | Use a 128-bit random secret (`openssl rand -hex 32`); length is enforced at config time (6–80 chars) |
-| Timing side channel on the secret | Constant-time path comparison (length is not secret) |
-| Status-code oracle on the secret path | Only `GET` is a knock; non-GET requests get the same `403` for the secret path and any other path, so no distinct status reveals a match |
-| Response caching by browsers/proxies | `Cache-Control: no-store` and `Pragma: no-cache` on knock responses |
-| Knock request reaching the backend | The middleware terminates the request itself and never calls `next` for a knock, including when `failClosed: false` |
-| Open redirect via `redirectURL` | Only same-origin absolute paths (starting with a single `/`) and absolute `http`/`https` URLs are accepted; `//host`, other schemes, control characters and backslashes (`/\evil` normalises to `//evil`) are rejected at config load |
-| Redis outage turning into an allow | Fail closed: `503`, never `next` for protected requests unless the operator explicitly sets `failClosed: false`. A knock is always terminated with `503` |
-| Header spoofing (`X-Forwarded-For` etc.) | Off by default (`RemoteAddr` is used). `clientIPHeader` must only be set when a trusted proxy overwrites it |
-| Static allowlist entries matching a spoofed client IP | Static entries match the resolved client IP, so they share the trust of `clientIPHeader`; keep it empty unless a trusted proxy overwrites it |
-| Secret leaking into logs | Knock URLs, paths and Redis credentials are never logged. Use `logClientIP: true` only if you accept logging client IPs |
-| Brute force on the knock path | Not covered by v1. Put the knock path behind a rate limit (`rateLimit` middleware) and/or a non-guessable secret, or wait for the HMAC token knock |
-| Redis compromise/exposure | Run Redis in-cluster, require a password, restrict it with a `NetworkPolicy` (see `deploy/redis.yaml`) |
+| Guessable path secret | Use a 128-bit random secret (`openssl rand -hex 32`); length is enforced at config time (6–80 chars) |
+| Timing side channel on secrets/passwords | Constant-time path, password and hash comparisons |
+| Weak password brute force | PBKDF2-HMAC-SHA256 hashes, per-IP login rate limiting, bounded concurrent KDFs, optional Traefik `rateLimit` |
+| Password leak in config/dashboard | Prefer `passwordHash` or a `credentialsFile` mounted from a Secret; `password` plaintext is for development only |
+| Password in URLs/logs | Login uses POST bodies, never query strings; authentication endpoints are never forwarded to the backend |
+| Session theft | 256-bit random ids, HMAC-signed cookie/token, `HttpOnly`, `Secure`, `SameSite=Lax`, `__Host-` cookie by default |
+| Session fixation | A new session id is generated on every login |
+| Logout/revocation | Redis `DEL` on logout; password change invalidates sessions via the credential fingerprint |
+| Redis outage turning into an allow | Session lookups always return `503`; IP allowlist follows `failClosed` |
+| Cookie/token replay across apps | HMAC and Redis keys include the realm; cookies include a realm-derived name |
+| CDN caching authenticated content | `Cache-Control: private` + `Vary: Cookie, Authorization` on protected responses by default |
+| Open redirect via `redirectURL` | Only same-origin paths and absolute `http`/`https` URLs; `//host`, other schemes, control characters and backslashes are rejected |
+| Header spoofing (`X-Forwarded-For` etc.) | Off by default. `clientIPHeader` must only be set behind a trusted proxy that overwrites it |
+| Static allowlist matching a spoofed IP | Static entries use the same resolved IP; keep `clientIPHeader` empty unless the proxy is trusted |
+| Secret leaking into startup logs | `knockPath`/`loginPath` validation errors do not echo the configured value |
+| Log flooding from denials | Login failures are rate-limited; use `logClientIP` only if you accept logging client IPs |
+| Redis compromise | Password, NetworkPolicy, and ideally TLS for cross-network Redis |
 
-Residual risks you must accept or handle outside the plugin:
+Residual risks:
 
-* Anyone who learns the secret URL can allowlist any IP they can make requests
-  from. Treat the URL like a password; rotate it by changing `knockPath`.
-* The allowlist is per client IP as seen by Traefik. Behind carrier-grade NAT /
-  a corporate proxy, knocking allowlists other users sharing that IP.
-* A stolen allowlist entry is valid for the whole TTL (default `2h`). Shorten
-  `ttl` for sensitive services.
+* A shared password identifies a group, not an individual. Use one username per
+  person if you need attribution or per-person revocation.
+* Password sessions are valid for the whole `sessionTTL`. Use a short TTL for
+  sensitive services and rotate `cookieSecret` to invalidate every session.
+* Basic auth sends the password on every request and has no logout; use it only
+  over TLS and preferably for API/CLI clients.
+* A stolen session token remains usable until logout, password change, or TTL
+  expiry.
+* Behind carrier-grade NAT, `grantMode: ip` shares access with other users of
+  the same public IP. `grantMode: session` avoids that.
 
 ## 5. Configuration reference
+
+### 5.1 Path mode (original behaviour)
 
 ```yaml
 httpKnock:
@@ -202,60 +299,141 @@ httpKnock:
 
   # Optional. Where a browser is sent after a successful knock. Set it to "/"
   # to land on the homepage (same origin), or to an absolute http(s) URL.
-  # Only paths starting with "/" and absolute http(s) URLs are accepted;
-  # "//host", other schemes and backslashes are rejected. Empty (default)
-  # keeps the plain 204 response.
   redirectURL: ""
 
-  # Required. "host:port" of Redis.
+  # Required for path/password modes. "host:port" of Redis.
   redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
-  # Optional, Redis >= 6 ACL style. Prefer a Secret for the password.
   redisUsername: ""
   redisPassword: ""
-  # Optional logical database (default 0).
   redisDB: 0
 
-  # Prefix of the Redis key (default "traefik:http-knock:").
   keyPrefix: "traefik:http-knock:"
-
-  # Optional. Only set when a trusted proxy always overwrites this header:
-  # "X-Real-IP", "CF-Connecting-IP", "X-Forwarded-For", ...
-  # Empty (default) means req.RemoteAddr (not spoofable).
   clientIPHeader: ""
-
-  # Optional. IPs and CIDR ranges that are always allowed: no knock and no
-  # Redis lookup. Entries are single IPs or CIDR ranges, IPv4 or IPv6. Empty
-  # (default) means only knocks grant access. Validated at load time.
   staticAllowlist: []
   #  - "203.0.113.7"
   #  - "192.168.0.0/16"
-  #  - "2001:db8::/32"
 
-  # true (default): Redis errors return 503. false: Redis errors let the
-  # request through (fail open). Never use false on a security boundary.
   failClosed: true
-
-  # Timeouts and pool size.
   dialTimeout: "2s"
   readTimeout: "1s"
   writeTimeout: "1s"
   redisPoolSize: 16
-
-  # Include client IPs in logs (default false).
   logClientIP: false
 ```
 
-Notes:
+### 5.2 Password mode
 
-* `failClosed` uses the same YAML name as the requested configuration but is a
-  `*bool` in Go so that "unset" can be distinguished from an explicit `false`.
-  Unset means `true`, which keeps the secure default. This is the only
-  intentional deviation from the original field list.
-* Invalid values make Traefik reject the middleware configuration at load time
-  with a descriptive error (for example a malformed `ttl`); no request is
-  served with a half-applied configuration.
+```yaml
+httpKnock:
+  # The login form and token endpoint. Defaults to knockPath.
+  knockPath: "/__knock__"
+  loginPath: "/__knock__"
+  authMode: password
+  # Send the browser to the homepage after login. Logout redirects back to
+  # loginPath.
+  redirectURL: "/"
+
+  # Use one of:
+  #
+  # 1) Inline hashes. Generate a bare hash with `make hash-password` or
+  #    `go run ./cmd/knockhash`; use `-username alice` only when generating a
+  #    "username:hash" line for a credentials file.
+  users:
+    - username: alice
+      passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
+    - username: bob
+      passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
+  #
+  # 2) A Secret-mounted credentials file. Lines are "username:hash" or
+  #    "username:plain:password" (development only). A line without a colon is
+  #    a shared password. Blank lines and "#" comments are ignored.
+  # credentialsFile: "/etc/traefik/secrets/http-knock-credentials"
+  #
+  # 3) An environment variable with the same line format.
+  # credentialsEnv: "HTTP_KNOCK_CREDENTIALS"
+
+  # ip | session | both. Defaults to session for password mode.
+  grantMode: session
+  sessionTTL: "12h"
+
+  # At least 32 bytes, shared by all Traefik replicas. Prefer a file mount.
+  cookieSecret: ""
+  cookieSecretFile: "/etc/traefik/secrets/http-knock-cookie-secret"
+  # cookieSecretEnv: "HTTP_KNOCK_COOKIE_SECRET"
+  cookieName: ""            # empty = realm-derived __Host- name
+  cookieSecure: true
+  cookieSameSite: "Lax"     # Lax | Strict | None
+
+  # Realm defaults to the Traefik middleware name. Set it explicitly when you
+  # want stable keys across middleware renames.
+  realm: ""
+
+  # Login protection. 0 disables the individual limit.
+  maxLoginAttempts: 5
+  loginWindow: "15m"
+  maxConcurrentLogins: 4
+
+  # CDN safety. Defaults to true for password/basic mode.
+  privateResponses: true
+
+  # Optional: forward the authenticated username to the backend. Any
+  # client-supplied value is removed first.
+  forwardUserHeader: ""
+
+  # Redis and other common fields are the same as in path mode.
+  ttl: "2h"
+  redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
+  redisPassword: ""
+  keyPrefix: "traefik:http-knock:"
+  failClosed: true
+  logClientIP: false
+```
+
+### 5.3 Basic auth mode (CLI/API)
+
+```yaml
+httpKnock:
+  knockPath: "/__knock__"         # still required by the config schema
+  authMode: basic
+  users:
+    - username: api
+      passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
+  staticAllowlist:
+    - "10.0.0.0/8"
+  privateResponses: true
+  logClientIP: false
+```
+
+Basic mode is stateless and does not need Redis. Login rate limiting is not
+applied to Basic requests; compose a Traefik `rateLimit` middleware if the
+endpoint is exposed to untrusted networks.
+
+### 5.4 Notes
+
+* Upgrading from v0.1.x: Redis keys are now realm-scoped, for example
+  `traefik:http-knock:<realm>:ip:<clientIP>` instead of
+  `traefik:http-knock:<clientIP>`. Old IP grants are ignored after the upgrade;
+  clients simply knock/log in again. Set `realm` explicitly if the Middleware
+  name may change.
+* Invalid values make Traefik reject the middleware at load time with a
+  descriptive error; no request is served with a half-applied configuration.
+* `failClosed` uses a `*bool` so that "unset" means `true`.
+* Password sessions always fail closed when Redis is unavailable, regardless of
+  `failClosed`. Password mode also needs Redis for the login rate limiter and
+  the session/IP grant, so `failClosed: false` does not make login work during a
+  Redis outage.
 * Redis is not contacted when the middleware is created, so a Redis outage
-  cannot break Traefik's startup.
+  cannot break Traefik startup.
+* Multiple users with the same non-empty username are rejected.
+* Usernames may contain letters, digits, `.`, `_`, `-` and `@` (max 64 bytes).
+* On plain HTTP (local development only), set `cookieSecure: false`. The
+  realm-derived default cookie name then drops the `__Host-` prefix, because
+  browsers reject `__Host-` cookies that are not Secure. Never disable
+  `cookieSecure` on an internet-facing HTTPS site.
+* Traefik can print the full dynamic configuration at `DEBUG` log level,
+  including inline `cookieSecret`, `passwordHash` and Redis credentials. Keep
+  Traefik at `INFO` in production and prefer `credentialsFile`,
+  `cookieSecretFile` and Secret-mounted Redis configuration.
 
 ## 6. Security considerations (detail)
 
@@ -271,6 +449,15 @@ knockPath: "/__knock__/9c4e2e4e3b6d0c0f7b1a2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e
 ```
 
 Rotate the secret by changing this value (rolling the Middleware is enough).
+
+For password mode, also generate a separate cookie-signing secret:
+
+```bash
+openssl rand -base64 32
+```
+
+Store it in `cookieSecretFile` or `cookieSecretEnv`. Rotating it invalidates all
+existing sessions.
 
 ### 6.2 `X-Forwarded-For` and friends
 
@@ -300,14 +487,14 @@ Client IPs come from `net.SplitHostPort` + `net.ParseIP` and are stored in
 canonical form:
 
 ```text
-192.168.1.10     -> traefik:http-knock:192.168.1.10
-[2001:db8::1]:443-> traefik:http-knock:2001:db8::1
-2001:0DB8:0::1   -> traefik:http-knock:2001:db8::1
+192.168.1.10     -> traefik:http-knock:<realm>:ip:192.168.1.10
+[2001:db8::1]:443-> traefik:http-knock:<realm>:ip:2001:db8::1
+2001:0DB8:0::1   -> traefik:http-knock:<realm>:ip:2001:db8::1
 ```
 
 Zones (`fe80::1%eth0`) are stripped. IPv4-mapped IPv6 addresses (`::ffff:10.0.0.1`)
 normalize to `10.0.0.1`, which is what Go's `net` package reports too, so a
-client seen over IPv4 and IPv4-mapped IPv6 shares one allowlist entry.
+client seen over IPv4 and IPv4-mapped IPv6 shares one IP grant.
 
 ### 6.4 Logging
 
@@ -315,13 +502,15 @@ Logged events (never the secret, never credentials):
 
 ```text
 knock succeeded for client <redacted|IP>
-knock rejected: method POST is not allowed
-knock rejected: no usable client IP found in the request
-request denied for client <redacted|IP>: no active knock
-redis unavailable for client <redacted|IP>: <error>
+login succeeded for client <redacted|IP>
+login failed for client <redacted|IP>
+logout succeeded for client <redacted|IP>
+request denied for client <redacted|IP>: no valid session or grant
+redis unavailable for session of client <redacted|IP>: <error>
 ```
 
-`logClientIP: false` (default) replaces the IP with `redacted`.
+`logClientIP: false` (default) replaces the IP with `redacted`. Passwords,
+password hashes, session ids, cookie values and bearer tokens are never logged.
 
 ## 7. Project tree
 
@@ -338,9 +527,16 @@ traefik-http-knock/
 ├── README.md
 ├── go.mod
 ├── knock.go                      # Config, CreateConfig, New, ServeHTTP
+├── auth.go                       # users, login form, cookies, sessions
+├── crypto.go                     # PBKDF2, HMAC, token signing, constant time
+├── ratelimit.go                  # per-IP login failure counters
+├── response.go                   # CDN-safe response writer
 ├── ip.go                         # client IP extraction, normalization, keys
 ├── redis.go                      # minimal RESP client + bounded pool
+├── cmd/knockhash/main.go         # password-hash generator
 ├── knock_test.go                 # middleware behaviour tests
+├── auth_test.go                  # password, session, Basic and realm tests
+├── crypto_test.go                # hash/token tests
 ├── ip_test.go                    # IP parsing tests
 ├── redis_test.go                 # RESP client/pool tests + Redis integration test
 ├── testserver_test.go            # in-process fake Redis used by the tests
@@ -351,6 +547,7 @@ traefik-http-knock/
     ├── plugin-configmap.yaml     # generated by `make k8s-plugin-configmap`
     ├── redis.yaml
     ├── middleware.yaml
+    ├── middleware-password.yaml
     ├── ingressroute.yaml
     ├── helmchartconfig.yaml
     ├── traefik-static-config.yml # static config for the custom image / docker run
@@ -375,7 +572,7 @@ Deviations from the originally sketched tree, and why:
   rather than committed, so the plugin source is not duplicated in the repo. A
   ConfigMap is capped at 1 MiB and is a convenience path; the custom image is
   the recommended production option.
-* `.github/workflows/ci.yml` — `fmt`, `vet`, `test`, `test -race` on every push.
+* `.github/workflows/ci.yml` — `fmt`, `vet`, `test`, `test -race` on every push and pull request; publishing runs only for `v*` tags.
 
 ## 8. Traefik v3 configuration
 
@@ -386,7 +583,7 @@ experimental:
   plugins:
     httpKnock:
       moduleName: github.com/ttgml/traefik-http-knock
-      version: v0.1.1
+      version: v0.2.0
 ```
 
 Requirements for a catalog release:
@@ -394,15 +591,15 @@ Requirements for a catalog release:
 * repository path equals the module path in `go.mod`,
 * `.traefik.yml` at the repository root with `import:` equal to that module
   path,
-* a semver tag (`v0.1.0`) that Traefik can resolve through the Go module proxy,
+* a semver tag such as `v0.2.0` that Traefik can resolve through the Go module proxy,
 * no `replace` directives and no dependencies outside the standard library
   (this plugin has none).
 
 Then release:
 
 ```bash
-make release PLUGIN_VERSION=v0.1.1   # runs the checks and creates an annotated tag
-git push origin v0.1.1
+make release PLUGIN_VERSION=v0.2.0   # runs the checks and creates an annotated tag
+git push origin v0.2.0
 ```
 
 ### 8.2 Local plugin (source mounted into the container)
@@ -456,9 +653,48 @@ spec:
         - name: http-knock
 ```
 
-Every request matching the router (including the knock URL on the same host)
-passes through the middleware. The knock path must be reachable on the same
-router, otherwise the knock never arrives.
+Every request matching the router (including the login/knock endpoint on the
+same host) passes through the middleware. The authentication endpoint must be
+reachable on the same router, otherwise it never arrives.
+
+Password mode uses the same Middleware shape. Generate a bare hash first:
+
+```bash
+go run ./cmd/knockhash
+# pbkdf2-sha256$120000$...
+```
+
+For a credentials file, generate a full line instead:
+
+```bash
+go run ./cmd/knockhash -username alice
+# alice:pbkdf2-sha256$120000$...
+```
+
+```yaml
+spec:
+  plugin:
+    httpKnock:
+      knockPath: "/__knock__"
+      loginPath: "/__knock__"
+      authMode: password
+      grantMode: session
+      users:
+        - username: alice
+          passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
+      cookieSecretFile: "/etc/traefik/secrets/http-knock-cookie-secret"
+      sessionTTL: "12h"
+      redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
+      redisPassword: "REPLACE_WITH_REDIS_PASSWORD"
+      realm: "example-com"
+      maxLoginAttempts: 5
+      loginWindow: "15m"
+      privateResponses: true
+```
+
+Mount the cookie secret and credentials as read-only Secret volumes in the
+Traefik pod. The Middleware CRD cannot reference a Secret directly, so use
+`credentialsFile`/`cookieSecretFile` rather than putting secrets in the CRD.
 
 ## 9. k3s deployment
 
@@ -471,12 +707,19 @@ kubectl apply -f deploy/namespace.yaml
 kubectl apply -f deploy/redis.yaml
 kubectl apply -f deploy/ingressroute.yaml
 
-# 2. Set a real knock secret and the Redis password
+# 2. Path mode: set a real knock secret and the Redis password
 SECRET=$(openssl rand -hex 32)
 REDIS_PASSWORD=$(kubectl -n traefik-http-knock get secret redis-auth -o jsonpath='{.data.password}' | base64 -d)
 sed -e "s|REPLACE_WITH_64_HEX_CHARS|${SECRET}|" \
     -e "s|REPLACE_WITH_REDIS_PASSWORD|${REDIS_PASSWORD}|" \
     deploy/middleware.yaml | kubectl apply -f -
+
+# Password mode instead:
+#   go run ./cmd/knockhash          # bare hash for inline users
+#   # or: go run ./cmd/knockhash -username alice   # for a credentials file
+#   COOKIE_SECRET=$(openssl rand -base64 32)
+#   render deploy/middleware-password.yaml with the hash, cookie secret and
+#   Redis password, then kubectl apply -f -
 
 # 3. Give Traefik the plugin (pick one of the two options below)
 kubectl apply -f deploy/helmchartconfig.yaml
@@ -491,8 +734,8 @@ curl -i http://<node-ip>/                        # 200
 ### 9.1 Option A (recommended): custom Traefik image
 
 ```bash
-docker build -t ghcr.io/<user>/traefik-http-knock:v0.1.1 .
-docker push ghcr.io/<user>/traefik-http-knock:v0.1.1
+docker build -t ghcr.io/<user>/traefik-http-knock:v0.2.0 .
+docker push ghcr.io/<user>/traefik-http-knock:v0.2.0
 ```
 
 Point the k3s Traefik at it (see `deploy/helmchartconfig.yaml`, Option A block).
@@ -546,11 +789,16 @@ k3s auto-restarts Traefik when the `HelmChartConfig` changes.
   CRD **cannot** reference a Secret, so the rendered manifest must come from
   your GitOps/secret pipeline (SOPS, sealed-secrets, `envsubst` at apply time as
   shown above). Never commit the real password or knock secret.
+* For password mode, mount a Secret containing `credentials` and
+  `cookie-secret` into the Traefik pod, then point `credentialsFile` and
+  `cookieSecretFile` at those paths. `HelmChartConfig` additionalVolumes/
+  additionalVolumeMounts can do this; the files are read when the middleware is
+  created.
 
 ## 10. Redis configuration
 
-The deployment uses an ephemeral Redis: the allowlist is intentionally
-expendable, and restarting Redis only means clients have to knock again.
+The deployment uses an ephemeral Redis: grants and sessions are intentionally
+expendable, and restarting Redis only means clients have to authenticate again.
 
 ```yaml
 args:
@@ -568,18 +816,19 @@ args:
 
 Operational notes:
 
-* `noeviction` so that a full Redis never silently drops allowlist entries
-  earlier than their TTL. Size `maxmemory` for peak knock load
-  (`clients × ~80 bytes`).
-* No persistence: allowlist data is not worth a volume.
+* `noeviction` so that a full Redis never silently drops grants/sessions
+  earlier than their TTL. Size `maxmemory` for peak session load
+  (`clients × ~150 bytes`).
+* No persistence: grants and sessions are not worth a volume.
 * A password plus a `NetworkPolicy` (only Traefik's namespace may connect) is the
   minimum in-cluster hardening.
 * For larger installations use a managed/external Redis (HA, auth, TLS) and
-  point `redisAddr` at it. The plugin speaks plain RESP over TCP; if you need
-  TLS to Redis, terminate it in a sidecar/socat proxy or open an issue — v1 has
-  no TLS support.
-* Keys are always written with an `EX` argument, so Redis expires them even if
-  the plugin disappears mid-flight.
+  point `redisAddr` at it. The plugin currently speaks plain RESP over TCP; if
+  you need TLS to Redis, terminate it in a sidecar/socat proxy or add
+  `crypto/tls` support.
+* IP/session keys are written with `SET ... EX`; login counters receive an
+  `EXPIRE` on the first failure. Redis therefore expires all state even if the
+  plugin disappears mid-flight.
 
 ## 11. Cloudflare / load balancer scenarios
 
@@ -594,22 +843,29 @@ Behind Cloudflare (or any reverse proxy / ingress in front of Traefik):
    and spoof the header.
 4. Keep `X-Forwarded-For` handling in mind: Traefik appends the peer to it, so
    the left-most entry is only trustworthy if the edge replaced the header.
-5. If Cloudflare's proxy sends IPv6 when a client prefers IPv6, knock and access
-   must both happen over the same family, otherwise the allowlist key differs.
-   Fix by forcing IPv4 at the edge or by knocking and browsing over the same
-   network.
+5. If Cloudflare's proxy sends IPv6 when a client prefers IPv6, IP grants and
+   access must use the same family or the key differs. Password sessions are
+   not IP-bound, so `grantMode: session` avoids this issue.
+6. If Cloudflare caches HTML/API responses, keep `privateResponses: true`
+   (password/basic default) or add a cache rule that bypasses protected paths.
+   Otherwise a response authorized by Alice's cookie could be served to Bob.
+   The plugin sets `Cache-Control: private` and `Vary: Cookie, Authorization`,
+   but a cache rule that ignores those headers still wins.
 
 ## 12. Failure modes and troubleshooting
 
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
-| Every request `403` after a successful knock | Knock and access use different source IPs (proxy, NAT, IPv6/IPv4 mix) | Log the resolved IP (`logClientIP: true`) and check which header/hop is used; compare with `redis-cli --scan` |
+| Every request `403` after a successful knock | Knock and access use different source IPs (proxy, NAT, IPv6/IPv4 mix) | Use `grantMode: session` for password auth, or log the resolved IP (`logClientIP: true`) and compare with `redis-cli --scan` |
+| Password login returns `429` | `maxLoginAttempts` reached for this IP | Wait for `loginWindow`, or clear `<prefix><realm>:login:<ip>` in Redis |
+| Login succeeds but the next request is `403` | Cookie not sent (wrong host/Secure/Path), or the session was revoked | Check the cookie in devtools; confirm `cookieSecure` matches HTTPS; inspect the session key in Redis |
+| Password cookie stops working with `503` | Redis is down; sessions always fail closed | Restore Redis; this is intentional even with `failClosed: false` |
 | Every request `503` | Redis unreachable, wrong `redisAddr`, auth failure, or `SELECT` to a disabled DB | `kubectl -n traefik-http-knock logs deploy/redis`, check the Secret, test with `redis-cli -h ... -a ...` |
-| `403` on the knock URL with a non-GET method | Only `GET` knocks; other methods are treated as protected requests | Use `curl -i` (a `GET`); `curl -I` sends `HEAD` and will not knock |
+| `403` on the path knock URL with a non-GET method | Only `GET` is a path knock; other methods are protected requests | Use `curl -i` (a `GET`); `curl -I` sends `HEAD` and will not knock |
 | Knock returns `204` but nothing is stored | Wrong Redis DB/prefix or you are looking at another Redis | Compare `keyPrefix` and `redisDB`, inspect with `redis-cli --scan --pattern '<prefix>*'` |
 | Traefik logs `command not found` / plugin not loaded | `moduleName` does not match `go.mod`, or source is not in `/plugins-local/src/<moduleName>` | Check the mount path and the `additionalArguments` value (case-sensitive) |
-| Plugin config rejected at startup | Invalid `knockPath`/`ttl`/timeouts | The error message names the field; see section 5 |
-| Allowlist entry disappears too early | `ttl` too short, or Redis evicted the key | Check `TTL <key>`; use `noeviction` and enough `maxmemory` |
+| Plugin config rejected at startup | Invalid path/ttl/timeouts, missing users, missing cookie secret | The error message names the field; see section 5 |
+| Grant or session disappears too early | TTL too short, or Redis evicted the key | Check `TTL <key>`; use `noeviction` and enough `maxmemory` |
 | Can allowlist arbitrary IPs | `clientIPHeader` set without a trusted proxy overwriting it | Remove `clientIPHeader` and rely on `RemoteAddr` |
 
 Useful checks:
@@ -630,7 +886,20 @@ go test -race ./...
 ```
 
 The unit tests use an in-process fake Redis server (`testserver_test.go`), so no
-Docker is required. The Redis integration test is opt-in:
+Docker is required. They cover path mode, password login, multiple users,
+sessions, logout/revocation, Basic auth, Bearer tokens, realm isolation, rate
+limiting, CDN headers, PBKDF2/HMAC, and the RESP client.
+
+Generate a password hash for local tests or deployment:
+
+```bash
+make hash-password
+# or: go run ./cmd/knockhash
+# For a credentials file line:
+go run ./cmd/knockhash -username alice
+```
+
+The Redis integration test is opt-in:
 
 ```bash
 docker run --rm -d -p 6379:6379 --name knock-redis redis:7.4-alpine \
@@ -649,7 +918,9 @@ curl -i http://localhost:8000/__knock__/0123456789abcdef0123456789abcdef01234567
 curl -i http://localhost:8000/                # 200 (whoami output)
 ```
 
-The compose secret is a development placeholder — never reuse it.
+The compose secret is a development placeholder — never reuse it. The compose
+demo uses path mode; for a password demo, point the Middleware at
+`authMode: password`, add a `users` entry, and mount/set a `cookieSecret`.
 
 ### 13.2 Yaegi constraints (important for contributors)
 
@@ -687,6 +958,12 @@ Verified live against **Traefik v3.2.5 + Redis 7.4** during development:
 | Protected request after the knock | `200`, backend reached |
 | Redis stopped | `503` for both knock and protected requests, no panic |
 | Redis `-NOPERM` on `SET` (server error) | `503`, connection reused, no panic |
+
+Password, session, Basic, Bearer, realm and CDN-header behavior is covered by the
+unit tests (`auth_test.go`, `crypto_test.go`, `redis_test.go`). The password
+login, Redis session cookie, protected request, logout/revocation, JSON Bearer
+flow, PBKDF2 hash verification and Basic auth were also exercised under Yaegi
+v0.16.1 and against Traefik v3.2.5 + Redis 7.4 end to end.
 
 ## 14. Usage with curl
 
@@ -735,11 +1012,54 @@ $ curl -i https://example.com/__knock__/guess
 HTTP/2 403
 ```
 
+### 14.1 Password mode with curl
+
+```bash
+# Browser flow: GET the login page, POST the form, keep the cookie jar.
+curl -c cookies.txt -b cookies.txt -i https://example.com/__knock__
+curl -c cookies.txt -b cookies.txt -i -X POST \
+  -d 'username=alice' -d 'password=...' https://example.com/__knock__
+curl -c cookies.txt -b cookies.txt -i https://example.com/
+
+# API flow: exchange credentials for a Bearer session token.
+TOKEN=$(curl -s -X POST \
+  -H 'Accept: application/json' \
+  -d 'username=alice' -d 'password=...' \
+  https://example.com/__knock__ | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+curl -i -H "Authorization: Bearer $TOKEN" https://example.com/
+
+# Logout (revokes the Redis session).
+curl -i -X POST -d 'action=logout' -H "Authorization: Bearer $TOKEN" \
+  https://example.com/__knock__
+```
+
+Basic auth mode:
+
+```bash
+curl -i -u alice:'...' https://example.com/
+```
+
+In basic mode, a request without credentials gets `401` with a
+`WWW-Authenticate` challenge. In password mode, a protected request without a
+session/IP grant gets `403`; a login with a wrong password gets `401`, and
+repeated failures get `429` once `maxLoginAttempts` is reached.
+
 ## 15. Production checklist
 
-* [ ] `knockPath` uses `openssl rand -hex 32` and is stored as a secret, not in
-      a public manifest.
-* [ ] The knock URL is shared over a secure channel and rotated when leaked.
+* [ ] In path mode, `knockPath` uses `openssl rand -hex 32` and is stored as a
+      secret, not in a public manifest.
+* [ ] In password mode, use per-user `passwordHash` values and a separate random
+      `cookieSecret` (>= 32 bytes) shared by all Traefik replicas.
+* [ ] Prefer `credentialsFile`/`cookieSecretFile` mounted from a Secret over
+      inline values in the Middleware CRD.
+* [ ] `sessionTTL` is short enough for your risk model; rotate `cookieSecret` to
+      invalidate all sessions.
+* [ ] `privateResponses: true` (default for password/basic) and the CDN is
+      configured not to cache protected responses.
+* [ ] Login rate limiting (`maxLoginAttempts`, `loginWindow`) is enabled, and a
+      Traefik `rateLimit` middleware is composed for Basic/API endpoints.
+* [ ] The knock URL/login endpoint is shared over a secure channel and rotated
+      when leaked.
 * [ ] `ttl` is the shortest acceptable window (minutes for admin panels, hours
       for personal sites).
 * [ ] `failClosed: true` (default) — never set it to `false` on a security
@@ -753,13 +1073,14 @@ HTTP/2 403
       pipeline (SOPS/sealed-secrets/CI), never committed.
 * [ ] `logClientIP` matches your privacy policy.
 * [ ] A `rateLimit` middleware is composed in front of the middleware to slow
-      down secret guessing.
+      down path-secret guessing and Basic-auth brute force.
 * [ ] `redisPoolSize` and Redis `maxmemory` are sized for peak traffic.
 * [ ] `go test -race ./...` is green in CI.
 * [ ] Alerts exist for `503` responses (Redis outage = total outage when failing
       closed).
-* [ ] The knock path is excluded from access logs if your log pipeline stores
-      full URLs (otherwise the secret is written to logs).
+* [ ] In path mode, the knock path is excluded from access logs if your log
+      pipeline stores full URLs (otherwise the secret is written to logs).
+      Password mode does not put credentials in URLs.
 
 ## 16. License
 

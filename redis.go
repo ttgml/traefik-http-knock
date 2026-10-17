@@ -14,8 +14,8 @@ import (
 // This file implements the small subset of Redis used by the plugin with the
 // Go standard library only. Traefik's plugin loader (Yaegi for local plugins,
 // vendoring rules for catalog plugins) makes every third-party dependency a
-// liability, and the plugin needs exactly four commands: AUTH, SELECT, EXISTS
-// and SET ... EX.
+// liability. The plugin needs AUTH, SELECT, PING, EXISTS, GET, SET ... EX,
+// INCR, EXPIRE and DEL.
 //
 // Supported replies: simple strings, errors, integers, bulk strings and arrays.
 // Anything else is reported as a protocol error and the connection is dropped.
@@ -216,9 +216,9 @@ func readRESP(r *bufio.Reader, depth int) (respValue, error) {
 // Bounds that keep a misbehaving peer from allocating arbitrary memory.
 const (
 	// maxBulkLength bounds a single bulk string. The commands this plugin uses
-	// (AUTH, SELECT, PING, EXISTS, SET) only ever return short bulk strings, so
-	// this is far above any legitimate reply while stopping a hostile or broken
-	// peer from making the plugin allocate hundreds of megabytes.
+	// only return short strings (session values, counters, errors), so this is
+	// far above any legitimate reply while stopping a hostile or broken peer
+	// from making the plugin allocate hundreds of megabytes.
 	maxBulkLength = 1 << 20
 	// maxLineLength bounds a single reply header line (simple strings, errors,
 	// integers and bulk/array lengths). Redis error messages are a few hundred
@@ -326,6 +326,51 @@ func (c *redisClient) setEx(key, value string, ttl time.Duration) error {
 		return nil
 	}
 	return fmt.Errorf("redis: unexpected SET reply %q", describeKind(reply))
+}
+
+// getValue implements GET key. The boolean is false for a nil reply (key absent).
+func (c *redisClient) getValue(key string) (string, bool, error) {
+	reply, err := c.doIdempotent("GET", key)
+	if err != nil {
+		return "", false, err
+	}
+	if reply.kind == respBulkString && reply.isNil {
+		return "", false, nil
+	}
+	if reply.kind == respBulkString || reply.kind == respSimpleString {
+		return reply.str, true, nil
+	}
+	return "", false, fmt.Errorf("redis: unexpected GET reply %q", describeKind(reply))
+}
+
+// del implements DEL key. It is idempotent: deleting a missing key is not an
+// error.
+func (c *redisClient) del(key string) error {
+	_, err := c.doIdempotent("DEL", key)
+	return err
+}
+
+// incr implements INCR key. Unlike EXISTS/SET/PING it is not idempotent, so it
+// must not be retried automatically: a lost reply would otherwise count the
+// same login failure twice.
+func (c *redisClient) incr(key string) (int64, error) {
+	reply, err := c.do("INCR", key)
+	if err != nil {
+		return 0, err
+	}
+	return reply.integer()
+}
+
+// expire implements EXPIRE key seconds.
+func (c *redisClient) expire(key string, ttl time.Duration) error {
+	reply, err := c.doIdempotent("EXPIRE", key, strconv.FormatInt(redisTTLSeconds(ttl), 10))
+	if err != nil {
+		return err
+	}
+	if _, err := reply.integer(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ping implements PING. It is used by tests and diagnostics, not by the

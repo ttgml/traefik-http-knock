@@ -1,0 +1,11 @@
+# Compose override for the CI/local end-to-end smoke test. It reuses the Redis
+# and whoami services from docker-compose.yml but swaps in the tracked e2e
+# Traefik configuration and exposes the password/basic entrypoints.
+services:
+  traefik:
+    ports:
+      - "8001:8001"
+      - "8002:8002"
+    volumes:
+      - ./.github/e2e/traefik.yml:/etc/traefik/traefik-compose.yml:ro
+      - ./.github/e2e/dynamic.yml:/etc/traefik/dynamic.yml:ro

@@ -31,13 +31,44 @@ func (w *privateResponseWriter) applyPrivateHeaders() {
 
 // applyPrivateHeaders marks a response as non-shared-cacheable. It preserves an
 // explicit "no-store" from the backend: private is weaker than no-store, and
-// overwriting it would make a sensitive response browser-cacheable.
+// overwriting it would make a sensitive response browser-cacheable. Other
+// stronger directives such as no-cache or must-revalidate are kept so adding
+// private does not let a browser serve a stale authenticated response without
+// revalidation. Shared-cache-only directives (public, s-maxage) are dropped.
 func applyPrivateHeaders(header http.Header) {
 	if !hasNoStore(header) {
-		header.Set("Cache-Control", "private")
+		header.Set("Cache-Control", privateCacheControl(header.Values("Cache-Control")))
 	}
 	addVary(header, "Cookie")
 	addVary(header, "Authorization")
+}
+
+// privateCacheControl returns the existing directives with private added and
+// shared-cache directives removed. It keeps max-age, no-cache, must-revalidate
+// and similar directives so the wrapper does not weaken the backend's policy.
+func privateCacheControl(values []string) string {
+	directives := make([]string, 0, 4)
+	for _, value := range values {
+		for _, part := range strings.Split(value, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			lower := strings.ToLower(part)
+			switch lower {
+			case "private":
+				continue
+			case "public":
+				continue
+			}
+			if strings.HasPrefix(lower, "s-maxage=") {
+				continue
+			}
+			directives = append(directives, part)
+		}
+	}
+	directives = append(directives, "private")
+	return strings.Join(directives, ", ")
 }
 
 func hasNoStore(header http.Header) bool {

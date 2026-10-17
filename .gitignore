@@ -8,6 +8,11 @@ deploy/plugin-configmap.yaml
 # Local three-mode test environment (docker-compose.local.yml + .local-test/)
 .local-test/
 
+# Local tool caches / coverage
+.gocache/
+.gotmp/
+*.cover
+
 # Editors / OS
 .DS_Store
 .idea/

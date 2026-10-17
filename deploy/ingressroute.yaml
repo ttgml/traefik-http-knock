@@ -68,6 +68,9 @@ metadata:
   name: whoami
   namespace: traefik-http-knock
 spec:
+  # The path-mode demo works over HTTP. For deploy/middleware-password.yaml,
+  # use the websecure route below instead: its cookie has Secure=true and a
+  # browser will not store it over plain HTTP.
   entryPoints:
     - web
   routes:

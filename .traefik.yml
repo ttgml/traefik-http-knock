@@ -20,4 +20,4 @@ testData:
   maxLoginAttempts: 5
   loginWindow: "15m"
   maxConcurrentLogins: 4
-  privateResponses: false
+  privateResponses: true

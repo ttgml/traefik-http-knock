@@ -55,7 +55,7 @@ experimental:
 ```
 
 Password and Basic modes are not part of the v0.2.1 release yet; use the
-local-plugin or custom-image setup from `main` until the next release.
+local-plugin or custom-image setup from `main` until v0.3.0 is published.
 
 ### 2. Define the middleware
 
@@ -78,6 +78,7 @@ spec:
       redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
       redisPassword: "REPLACE_WITH_REDIS_PASSWORD"
       failClosed: true
+      privateResponses: true
 ```
 
 Generate the secret with:
@@ -121,14 +122,14 @@ Generate a password hash from a repository checkout:
 
 ```bash
 go run ./cmd/knockhash
-# pbkdf2-sha256$120000$...
+# pbkdf2-sha256$600000$...
 ```
 
 Or a full credentials-file line:
 
 ```bash
 go run ./cmd/knockhash -username alice
-# alice:pbkdf2-sha256$120000$...
+# alice:pbkdf2-sha256$600000$...
 ```
 
 Minimal middleware:
@@ -143,7 +144,7 @@ spec:
       grantMode: session             # session | ip | both
       users:
         - username: alice
-          passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
+          passwordHash: "pbkdf2-sha256$600000$BASE64_SALT$BASE64_HASH"
       cookieSecretFile: "/etc/traefik/secrets/http-knock-cookie-secret"
       sessionTTL: "12h"
       redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
@@ -154,9 +155,10 @@ spec:
       privateResponses: true
 ```
 
-`cookieSecret` must be at least 32 bytes and shared by all Traefik replicas.
-Prefer the file mount over inline values. `grantMode: ip` issues no session or
-token; `grantMode: both` accepts either.
+With `grantMode: session` or `both`, `cookieSecret` must be at least 32 bytes and
+shared by all Traefik replicas. Prefer the file mount over inline values.
+`grantMode: ip` issues no session or token, so it does not require a secret;
+`grantMode: both` accepts either.
 
 Login with curl (browser flow):
 
@@ -201,7 +203,7 @@ spec:
       authMode: basic
       users:
         - username: api
-          passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
+          passwordHash: "pbkdf2-sha256$600000$BASE64_SALT$BASE64_HASH"
       privateResponses: true
 ```
 
@@ -210,7 +212,8 @@ curl -i -u api:'...' https://example.com/
 ```
 
 Basic mode is stateless and does not use Redis. Every request runs a PBKDF2
-verification (tens of milliseconds with the default cost), so it is CPU-bound
+verification (tens to low hundreds of milliseconds with the default 600,000
+iterations), so it is CPU-bound
 and has no per-IP login rate limit; `maxConcurrentLogins` only bounds concurrent
 verifications. Put a Traefik `rateLimit` middleware in front of it, and prefer it
 for API/CLI clients over HTTPS. A request without credentials gets `401` with a
@@ -228,19 +231,19 @@ Common fields:
 | `loginPath` | `knockPath` | Password login endpoint; only used in password mode. |
 | `redirectURL` | empty | Send the browser to `/` or an absolute `http(s)` URL after a successful knock/login. |
 | `ttl` | `2h` | Lifetime of an IP grant. |
-| `sessionTTL` | `ttl` | Lifetime of a password session. |
+| `sessionTTL` | `ttl` | Lifetime of a password session (`session`/`both`). |
 | `realm` | middleware name + endpoint digest | Scope for Redis keys, cookies and tokens. Set explicitly when sharing Redis. |
-| `keyPrefix` | `traefik:http-knock:` | Prefix for all Redis keys. |
+| `keyPrefix` | `traefik:http-knock:` | Prefix for all Redis keys (path/password). |
 | `redisAddr` | — | `host:port`; required for `path`/`password`. |
 | `redisUsername` / `redisPassword` / `redisDB` | empty / empty / `0` | Redis connection settings. |
-| `staticAllowlist` | empty | IPs/CIDRs that are always allowed, without Redis. |
+| `staticAllowlist` | empty | IPs/CIDRs that bypass the knock and, in password/basic mode, authentication. No Redis lookup. |
 | `clientIPHeader` | empty (use `RemoteAddr`) | Only set behind a trusted proxy that overwrites it. |
 | `failClosed` | `true` | Return `503` when Redis is unreachable. |
 | `dialTimeout` / `readTimeout` / `writeTimeout` | `2s` / `1s` / `1s` | Redis timeouts. |
 | `redisPoolSize` | `16` | Maximum pooled Redis connections. |
 | `logClientIP` | `false` | Log client IPs instead of `redacted`. |
-| `privateResponses` | `false` (path) / `true` (password/basic) | Add `Cache-Control: private` and `Vary` to protected responses. |
-| `forwardUserHeader` | empty | Forward the authenticated username to the backend (client values are stripped first). |
+| `privateResponses` | `true` | Add `Cache-Control: private` and `Vary` to protected responses. Set `false` only when shared caching is intentional. |
+| `forwardUserHeader` | empty | Forward the authenticated username (session/Basic only; IP grants are anonymous). Client values are stripped first. |
 
 Password-related fields:
 
@@ -248,10 +251,10 @@ Password-related fields:
 | --- | --- | --- |
 | `users` | — | Inline `username` + `passwordHash` (or `password`, development only). |
 | `credentialsFile` / `credentialsEnv` | empty | `username:hash` lines, or a shared `hash` line. `#` comments and blank lines are ignored. |
-| `cookieSecret` / `cookieSecretFile` / `cookieSecretEnv` | — | Session-signing secret, at least 32 bytes. File takes precedence. |
+| `cookieSecret` / `cookieSecretFile` / `cookieSecretEnv` | — | Session-signing secret, at least 32 bytes; required for `grantMode: session`/`both`, optional for `ip`. File takes precedence. |
 | `cookieName` | realm-derived `__Host-` name | Session cookie name. |
 | `cookieSecure` / `cookieSameSite` | `true` / `Lax` | Cookie flags. Set `cookieSecure: false` only for local HTTP. |
-| `maxLoginAttempts` / `loginWindow` | `5` / `15m` | Per-IP login attempt limit; `0` disables it. |
+| `maxLoginAttempts` / `loginWindow` | `5` / `15m` | Per-IP login attempt limit in password mode; `0` disables it. |
 | `maxConcurrentLogins` | `4` | Bound on concurrent PBKDF2 verifications (form and Basic); `0` disables it. |
 
 Notes:
@@ -272,6 +275,16 @@ Notes:
 * Password changes and user removals revoke existing sessions and password-mode
   IP grants on their next use.
 * A `cookieSecret` rotation invalidates every session.
+* `grantMode: ip` issues no session/token, so `cookieSecret` is optional there;
+  it is still validated if provided. Basic and path mode ignore cookie settings.
+* `staticAllowlist` bypasses authentication in password and Basic mode, not
+  just the Redis lookup. Only list networks you fully trust.
+* New password hashes use 600,000 PBKDF2 iterations by default. Existing hashes
+  keep the iteration count stored in the hash and continue to verify.
+* Path mode now defaults `privateResponses` to `true` like the other modes. Set
+  it to `false` explicitly only if a shared cache is allowed to store protected
+  responses; older path-mode configs that relied on the previous default need
+  that opt-out.
 * Upgrading from v0.1.x: Redis keys are now realm-scoped, so old grants are
   ignored and clients simply knock/log in again.
 
@@ -321,7 +334,11 @@ kubectl apply -f deploy/helmchartconfig.yaml
 ```
 
 For password mode, render `deploy/middleware-password.yaml` instead, and mount
-the credentials and cookie secret as read-only Secret volumes.
+the credentials and cookie secret as read-only Secret volumes. That example uses
+`cookieSecure: true`, so route it through the `websecure` entrypoint (the TLS
+IngressRoute at the bottom of `deploy/ingressroute.yaml`); over plain HTTP the
+browser drops the cookie and login appears to succeed but protected requests
+stay `403`.
 
 To install the plugin without a custom image, build a ConfigMap and apply it
 before the `HelmChartConfig`:
@@ -364,7 +381,7 @@ CI) and never commit real secrets.
 | `403` on the knock URL with a non-GET method | Only `GET` is a knock | Use `curl -i`; `curl -I` sends `HEAD` |
 | Knock returns `204` but nothing is stored | Wrong Redis DB/prefix, or a different Redis | Compare `keyPrefix` and `redisDB` |
 | Plugin not loaded | `moduleName` mismatch or wrong mount path | Check `/plugins-local/src/<moduleName>` and the `additionalArguments` value |
-| Plugin config rejected at startup | Invalid path/ttl/timeouts, missing users or cookie secret | The error names the field |
+| Plugin config rejected at startup | Invalid path/ttl/timeouts, missing users, or a missing/invalid session cookie secret | The error names the field |
 | Grant or session disappears too early | TTL too short, or Redis evicted the key | Check `TTL <key>`; use `noeviction` and enough `maxmemory` |
 | Arbitrary IPs can be allowlisted | `clientIPHeader` set without a trusted proxy overwriting it | Remove `clientIPHeader` and rely on `RemoteAddr` |
 
@@ -382,9 +399,10 @@ kubectl -n traefik-http-knock exec deploy/redis -- \
   enforces 6-80 characters but only a random secret is hard to guess. Rotate it
   by changing the value and rolling the middleware.
 * **Passwords.** Prefer `passwordHash` or a Secret-mounted `credentialsFile` over
-  plaintext. PBKDF2-HMAC-SHA256, per-IP login attempt limiting and bounded
-  concurrent KDFs are built in. Use one username per person if you need
-  attribution or per-person revocation.
+  plaintext. New hashes default to 600,000 PBKDF2-HMAC-SHA256 iterations (the
+  OWASP recommendation); per-IP login attempt limiting and bounded concurrent
+  KDFs are built in. Use one username per person if you need attribution or
+  per-person revocation.
 * **Session cookie.** Requires a separate random `cookieSecret` (≥ 32 bytes)
   shared by all replicas, and HTTPS. Cookies are `HttpOnly`, `Secure`,
   `SameSite=Lax` and use a realm-derived `__Host-` name by default.
@@ -395,8 +413,9 @@ kubectl -n traefik-http-knock exec deploy/redis -- \
   the left-most entry is used.
 * **Fail closed.** Keep `failClosed: true`. Password sessions always fail closed
   regardless of this setting.
-* **CDN caching.** Keep `privateResponses: true` so a response authorized by one
-  client's cookie cannot be cached and served to another.
+* **CDN caching.** `privateResponses` defaults to `true` in every mode; leave it
+  enabled so a response authorized by one client cannot be cached and served to
+  another.
 * **CSRF.** Login/logout POSTs are checked against same-origin headers. A client
   that sends none of them is treated as non-browser and allowed; add a signed
   CSRF token or an edge WAF if that residual risk is unacceptable.
@@ -405,7 +424,8 @@ kubectl -n traefik-http-knock exec deploy/redis -- \
   a `rateLimit`.
 * **Shared IPs.** With `grantMode: ip`, users behind the same NAT/CGNAT share
   access, and changing one user's password revokes the whole shared IP grant.
-  `grantMode: session` avoids both.
+  `grantMode: session` avoids both. IP grants are anonymous, so
+  `forwardUserHeader` is empty for requests authorized that way.
 * **Logging.** Secrets, passwords, session ids and tokens are never logged.
   `logClientIP` is off by default. In path mode, exclude the knock URL from
   access logs if your pipeline stores full URLs.
@@ -425,7 +445,7 @@ kubectl -n traefik-http-knock exec deploy/redis -- \
 | Redis unavailable | `503` |
 
 Successful authentication responses carry `Cache-Control: no-store`; protected
-responses in password/basic mode are marked private by default.
+responses are marked private by default in every mode.
 
 ## Contributing
 
@@ -435,6 +455,7 @@ constraints and release process. Quick checks:
 ```bash
 go test ./...
 go test -race ./...
+make e2e            # Traefik + Yaegi + Redis compose smoke test
 ```
 
 ## License

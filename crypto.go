@@ -25,7 +25,10 @@ const (
 	// DefaultPBKDF2Iterations is used by HashPassword when no explicit
 	// iteration count is given. Verification uses the count stored in the hash,
 	// so this value can be raised later without invalidating existing hashes.
-	DefaultPBKDF2Iterations = 120000
+	// The default follows the OWASP recommendation for PBKDF2-HMAC-SHA256
+	// (600,000 iterations); hashes created with the previous 120,000 default
+	// keep verifying with their stored count.
+	DefaultPBKDF2Iterations = 600000
 
 	minPBKDF2Iterations = 10000
 	maxPBKDF2Iterations = 10000000

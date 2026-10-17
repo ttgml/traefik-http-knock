@@ -575,8 +575,10 @@ func TestPrivateResponseHeadersOverrideBackendCache(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
-	if got := rec.Header().Get("Cache-Control"); got != "private" {
-		t.Fatalf("Cache-Control = %q, want private", got)
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "private") || strings.Contains(got, "public") {
+		t.Fatalf("Cache-Control = %q, want private without public", got)
+	} else if !strings.Contains(got, "max-age=3600") {
+		t.Fatalf("Cache-Control = %q, want the backend max-age preserved", got)
 	}
 	vary := strings.Join(rec.Header().Values("Vary"), ",")
 	if !strings.Contains(vary, "Cookie") || !strings.Contains(vary, "Authorization") {
@@ -627,6 +629,23 @@ func TestPasswordConfigValidation(t *testing.T) {
 		wantErr string
 	}{
 		{name: "valid password config"},
+		{name: "valid password ip config without cookie secret", mutate: func(c *Config) {
+			c.GrantMode = GrantModeIP
+			c.CookieSecret = ""
+		}},
+		{name: "password ip ignores session ttl", mutate: func(c *Config) {
+			c.GrantMode = GrantModeIP
+			c.SessionTTL = "not-a-duration"
+		}},
+		{name: "password ip ignores login window when limiter disabled", mutate: func(c *Config) {
+			c.GrantMode = GrantModeIP
+			c.MaxLoginAttempts = 0
+			c.LoginWindow = "not-a-duration"
+		}},
+		{name: "password ip still rejects a short provided secret", mutate: func(c *Config) {
+			c.GrantMode = GrantModeIP
+			c.CookieSecret = "short"
+		}, wantErr: "at least 32"},
 		{name: "valid basic config without redis", mutate: func(c *Config) {
 			c.AuthMode = AuthModeBasic
 			c.GrantMode = ""
@@ -683,6 +702,43 @@ func TestPasswordConfigValidation(t *testing.T) {
 				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestUnusedSettingsByModeAreNotValidated(t *testing.T) {
+	basic := CreateConfig()
+	basic.KnockPath = testKnockPath
+	basic.AuthMode = AuthModeBasic
+	basic.Users = []User{{Username: "api", Password: "secret"}}
+	basic.RedisAddr = ""
+	basic.TTL = "not-a-duration"
+	basic.DialTimeout = "not-a-duration"
+	basic.ReadTimeout = "not-a-duration"
+	basic.WriteTimeout = "not-a-duration"
+	basic.RedisPoolSize = -2
+	basic.RedisDB = -1
+	basic.KeyPrefix = "bad prefix"
+	basic.CookieSecret = "short"
+	basic.CookieName = "bad cookie"
+	basic.CookieSameSite = "None"
+	basic.CookieSecure = boolPtr(false)
+	basic.SessionTTL = "not-a-duration"
+	basic.LoginWindow = "not-a-duration"
+	if err := basic.Validate(); err != nil {
+		t.Fatalf("basic mode rejected settings it never uses: %v", err)
+	}
+
+	path := CreateConfig()
+	path.KnockPath = testKnockPath
+	path.RedisAddr = "redis:6379"
+	path.CookieSecret = "short"
+	path.CookieName = "bad cookie"
+	path.CookieSameSite = "None"
+	path.CookieSecure = boolPtr(false)
+	path.SessionTTL = "not-a-duration"
+	path.LoginWindow = "not-a-duration"
+	if err := path.Validate(); err != nil {
+		t.Fatalf("path mode rejected cookie/session settings it never uses: %v", err)
 	}
 }
 
@@ -826,6 +882,95 @@ func TestPasswordChangeRevokesExistingSession(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedLoginPageRedirects(t *testing.T) {
+	handler, _, _, cfg := newPasswordHarness(t, func(c *Config) {
+		c.RedirectURL = "/"
+	})
+
+	login := httptest.NewRecorder()
+	handler.ServeHTTP(login, loginRequest("alice", "correct horse", "10.2.0.21:1234"))
+	if login.Code != http.StatusSeeOther {
+		t.Fatalf("login status = %d, want 303", login.Code)
+	}
+	cookie := cookieFrom(login, cfg.CookieName)
+	if cookie == nil {
+		t.Fatal("login did not set a session cookie")
+	}
+
+	req := newRequest(http.MethodGet, "https://example.com"+testKnockPath, "10.2.0.21:1234")
+	addCookie(req, cookie)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("authenticated login page status = %d, want 303", rec.Code)
+	}
+	if got := rec.Header().Get("Location"); got != "/" {
+		t.Fatalf("Location = %q, want /", got)
+	}
+}
+
+func TestAuthenticatedLoginPageWithoutRedirect(t *testing.T) {
+	handler, _, _, cfg := newPasswordHarness(t, nil)
+
+	login := httptest.NewRecorder()
+	handler.ServeHTTP(login, loginRequest("alice", "correct horse", "10.2.0.22:1234"))
+	if login.Code != http.StatusNoContent {
+		t.Fatalf("login status = %d, want 204", login.Code)
+	}
+	cookie := cookieFrom(login, cfg.CookieName)
+	if cookie == nil {
+		t.Fatal("login did not set a session cookie")
+	}
+
+	req := newRequest(http.MethodGet, "https://example.com"+testKnockPath, "10.2.0.22:1234")
+	addCookie(req, cookie)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("authenticated login page status = %d, want 204", rec.Code)
+	}
+}
+
+func TestUnknownUsernameUsesDummyVerification(t *testing.T) {
+	hash, err := HashPassword("known-password", minPBKDF2Iterations)
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	users, err := buildUserSet([]User{{Username: "alice", PasswordHash: hash}}, "", "")
+	if err != nil {
+		t.Fatalf("buildUserSet: %v", err)
+	}
+
+	for _, username := range []string{"nobody", ""} {
+		if _, ok := users.authenticate(username, "wrong-password"); ok {
+			t.Fatalf("authenticate(%q) accepted a wrong password", username)
+		}
+	}
+	if _, ok := users.authenticate("alice", "known-password"); !ok {
+		t.Fatal("the known user was rejected")
+	}
+}
+
+func TestSameOriginURLDefaultPorts(t *testing.T) {
+	req := newRequest(http.MethodPost, "https://example.com/private", "10.2.0.23:1234")
+	req.Host = "example.com"
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	if !sameOriginURL(req, "https://example.com:443") {
+		t.Fatal("explicit default HTTPS port must match an implicit one")
+	}
+	req.Host = "example.com:443"
+	if !sameOriginURL(req, "https://example.com") {
+		t.Fatal("implicit default HTTPS port must match an explicit one")
+	}
+	if sameOriginURL(req, "http://example.com") {
+		t.Fatal("a different scheme must not be same-origin")
+	}
+	if defaultPort("https") != "443" || defaultPort("http") != "80" || defaultPort("HTTPS") != "443" {
+		t.Fatal("defaultPort returned an unexpected value")
+	}
+}
+
 func TestAuthConfigDefaults(t *testing.T) {
 	cfg := CreateConfig()
 	if cfg.AuthMode != AuthModePath {
@@ -860,8 +1005,18 @@ func TestAuthConfigDefaults(t *testing.T) {
 	if s.realm == "my-middleware" || !strings.HasPrefix(s.realm, "my-middleware-") {
 		t.Fatalf("realm = %q, want a name plus a configuration digest", s.realm)
 	}
-	if s.privateResponses {
-		t.Fatal("path mode must default privateResponses to false for backward compatibility")
+	if !s.privateResponses {
+		t.Fatal("path mode must default privateResponses to true")
+	}
+
+	// Backends that intentionally allow shared caching can still opt out.
+	cfg.PrivateResponses = boolPtr(false)
+	optedOut, err := cfg.settingsFor("my-middleware")
+	if err != nil {
+		t.Fatalf("opt-out settingsFor: %v", err)
+	}
+	if optedOut.privateResponses {
+		t.Fatal("privateResponses: false must disable private responses")
 	}
 
 	// Two configurations that share a middleware name but not their endpoint

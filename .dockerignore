@@ -14,3 +14,7 @@ deploy/helmchartconfig.yaml
 deploy/plugin-configmap.yaml
 deploy/traefik-compose.yml
 deploy/traefik-compose-dynamic.yml
+.local-test/
+.gocache/
+.gotmp/
+*.cover

@@ -121,6 +121,10 @@ type Config struct {
 	// single IPs ("10.0.0.1", "2001:db8::1") or CIDR ranges ("10.0.0.0/8",
 	// "2001:db8::/32").
 	//
+	// In password and Basic mode a match bypasses authentication entirely: the
+	// request is forwarded without checking credentials. This is intentional,
+	// so only list networks you fully trust.
+	//
 	// SECURITY: static entries are matched against the resolved client IP, so
 	// they inherit the trust of how that IP is determined. When ClientIPHeader
 	// is set without a trusted proxy overwriting it, a client can spoof an IP
@@ -216,8 +220,9 @@ type Config struct {
 	CookieName string `json:"cookieName,omitempty"`
 
 	// CookieSecret signs session cookies/tokens. It must be at least 32 bytes
-	// and should be shared by all Traefik replicas. It is required in password
-	// mode.
+	// and should be shared by all Traefik replicas. It is required when
+	// GrantMode is "session" or "both"; "ip" does not issue sessions, so the
+	// secret is optional there.
 	CookieSecret string `json:"cookieSecret,omitempty"`
 
 	// CookieSecretFile reads CookieSecret from a file. It takes precedence over
@@ -254,9 +259,10 @@ type Config struct {
 
 	// PrivateResponses forces Cache-Control: private and Vary: Cookie,
 	// Authorization on protected responses, so a CDN cannot cache content
-	// authorized by a cookie/header and serve it to someone else. A backend's
-	// stronger no-store directive is preserved. It defaults to true for
-	// password/basic mode and false for the legacy path mode.
+	// authorized by a cookie/header and serve it to someone else. Stronger
+	// backend directives (no-store, no-cache, must-revalidate) are preserved.
+	// It defaults to true in every auth mode; set it to false only when a
+	// shared cache is intentionally allowed to store protected responses.
 	PrivateResponses *bool `json:"privateResponses,omitempty"`
 
 	// ForwardUserHeader optionally forwards the authenticated username to the
@@ -284,6 +290,7 @@ func CreateConfig() *Config {
 		MaxLoginAttempts:    defaultMaxLoginAttempts,
 		LoginWindow:         defaultLoginWindow.String(),
 		MaxConcurrentLogins: defaultMaxConcurrent,
+		PrivateResponses:    boolPtr(true),
 	}
 }
 
@@ -448,6 +455,9 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 	}
 
 	needRedis := s.authMode == AuthModePath || s.authMode == AuthModePassword
+	needCookies := s.authMode == AuthModePassword
+	needSessionSecret := needCookies && s.sessionGrantsEnabled()
+
 	if needRedis {
 		if s.redisAddr == "" {
 			return nil, errors.New("http-knock: redisAddr must not be empty")
@@ -455,48 +465,64 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 		if _, _, err := net.SplitHostPort(s.redisAddr); err != nil {
 			return nil, fmt.Errorf("http-knock: redisAddr must be in host:port form: %v", err)
 		}
-	}
-	if s.redisDB < 0 {
-		return nil, fmt.Errorf("http-knock: redisDB must not be negative, got %d", s.redisDB)
+		if s.redisDB < 0 {
+			return nil, fmt.Errorf("http-knock: redisDB must not be negative, got %d", s.redisDB)
+		}
 	}
 	if s.clientIPHeader != "" && !validHeaderName(s.clientIPHeader) {
 		return nil, fmt.Errorf("http-knock: clientIPHeader %q is not a valid HTTP header name", c.ClientIPHeader)
 	}
 
-	ttl, err := parseDuration("ttl", c.TTL, DefaultTTL)
-	if err != nil {
-		return nil, err
-	}
-	s.ttl = ttl
+	if needRedis {
+		ttl, err := parseDuration("ttl", c.TTL, DefaultTTL)
+		if err != nil {
+			return nil, err
+		}
+		s.ttl = ttl
 
-	dialTimeout, err := parseDuration("dialTimeout", c.DialTimeout, defaultDialTimeout)
-	if err != nil {
-		return nil, err
-	}
-	s.dialTimeout = dialTimeout
+		dialTimeout, err := parseDuration("dialTimeout", c.DialTimeout, defaultDialTimeout)
+		if err != nil {
+			return nil, err
+		}
+		s.dialTimeout = dialTimeout
 
-	readTimeout, err := parseDuration("readTimeout", c.ReadTimeout, defaultReadTimeout)
-	if err != nil {
-		return nil, err
-	}
-	s.readTimeout = readTimeout
+		readTimeout, err := parseDuration("readTimeout", c.ReadTimeout, defaultReadTimeout)
+		if err != nil {
+			return nil, err
+		}
+		s.readTimeout = readTimeout
 
-	writeTimeout, err := parseDuration("writeTimeout", c.WriteTimeout, defaultWriteTimeout)
-	if err != nil {
-		return nil, err
-	}
-	s.writeTimeout = writeTimeout
+		writeTimeout, err := parseDuration("writeTimeout", c.WriteTimeout, defaultWriteTimeout)
+		if err != nil {
+			return nil, err
+		}
+		s.writeTimeout = writeTimeout
 
-	s.redisPoolSize, err = parsePoolSize(c.RedisPoolSize)
-	if err != nil {
-		return nil, err
+		poolSize, err := parsePoolSize(c.RedisPoolSize)
+		if err != nil {
+			return nil, err
+		}
+		s.redisPoolSize = poolSize
+	} else {
+		// Basic auth is stateless and never contacts Redis. Keep the defaults so
+		// settings has no zero-value surprises, but do not reject Redis settings
+		// that this mode does not use.
+		s.ttl = DefaultTTL
+		s.dialTimeout = defaultDialTimeout
+		s.readTimeout = defaultReadTimeout
+		s.writeTimeout = defaultWriteTimeout
+		s.redisPoolSize = defaultRedisPoolSize
 	}
 
-	if s.keyPrefix == "" {
+	if needRedis {
+		if s.keyPrefix == "" {
+			s.keyPrefix = DefaultKeyPrefix
+		}
+		if !validKeyPrefix(s.keyPrefix) {
+			return nil, errors.New("http-knock: keyPrefix must not contain whitespace or control characters")
+		}
+	} else {
 		s.keyPrefix = DefaultKeyPrefix
-	}
-	if !validKeyPrefix(s.keyPrefix) {
-		return nil, errors.New("http-knock: keyPrefix must not contain whitespace or control characters")
 	}
 
 	redirectURL, err := parseRedirectURL(c.RedirectURL)
@@ -513,13 +539,27 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 
 	s.failClosed = c.FailClosed == nil || *c.FailClosed
 
-	s.sessionTTL, err = parseDuration("sessionTTL", c.SessionTTL, s.ttl)
-	if err != nil {
-		return nil, err
+	if needSessionSecret {
+		sessionTTL, err := parseDuration("sessionTTL", c.SessionTTL, s.ttl)
+		if err != nil {
+			return nil, err
+		}
+		s.sessionTTL = sessionTTL
+	} else {
+		// grantMode ip issues no session/token, so sessionTTL is not used.
+		s.sessionTTL = s.ttl
 	}
-	s.loginWindow, err = parseDuration("loginWindow", c.LoginWindow, defaultLoginWindow)
-	if err != nil {
-		return nil, err
+
+	if s.authMode == AuthModePassword && c.MaxLoginAttempts > 0 {
+		loginWindow, err := parseDuration("loginWindow", c.LoginWindow, defaultLoginWindow)
+		if err != nil {
+			return nil, err
+		}
+		s.loginWindow = loginWindow
+	} else {
+		// Basic and path mode never reserve login attempts, and setting
+		// maxLoginAttempts to 0 disables the limiter entirely.
+		s.loginWindow = defaultLoginWindow
 	}
 	if c.MaxLoginAttempts < 0 {
 		return nil, fmt.Errorf("http-knock: maxLoginAttempts must not be negative, got %d", c.MaxLoginAttempts)
@@ -531,36 +571,46 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 	s.maxConcurrentLogins = c.MaxConcurrentLogins
 
 	s.cookieSecure = true
-	if c.CookieSecure != nil {
-		s.cookieSecure = *c.CookieSecure
-	}
-	s.cookieSameSite, err = parseSameSite(c.CookieSameSite)
-	if err != nil {
-		return nil, err
-	}
-	s.cookieName = strings.TrimSpace(c.CookieName)
-	if s.cookieName == "" {
-		s.cookieName = cookieNameFor(s.realm, s.cookieSecure)
-	}
-	if !validCookieName(s.cookieName) {
-		return nil, fmt.Errorf("http-knock: cookieName %q is not a valid cookie name", s.cookieName)
-	}
-	if strings.HasPrefix(s.cookieName, "__Host-") && !s.cookieSecure {
-		return nil, errors.New("http-knock: a __Host- cookie requires cookieSecure: true")
-	}
-	if s.cookieSameSite == http.SameSiteNoneMode && !s.cookieSecure {
-		return nil, errors.New("http-knock: cookieSameSite None requires cookieSecure: true")
-	}
-
-	if s.authMode == AuthModePassword {
-		secret, err := loadSecret(c.CookieSecret, c.CookieSecretFile, c.CookieSecretEnv, "cookieSecret")
+	s.cookieSameSite = http.SameSiteLaxMode
+	if needCookies {
+		if c.CookieSecure != nil {
+			s.cookieSecure = *c.CookieSecure
+		}
+		sameSite, err := parseSameSite(c.CookieSameSite)
 		if err != nil {
 			return nil, err
 		}
-		if len(secret) < minCookieSecretLength {
-			return nil, fmt.Errorf("http-knock: cookieSecret must be at least %d bytes", minCookieSecretLength)
+		s.cookieSameSite = sameSite
+
+		s.cookieName = strings.TrimSpace(c.CookieName)
+		if s.cookieName == "" {
+			s.cookieName = cookieNameFor(s.realm, s.cookieSecure)
 		}
-		s.cookieSecret = secret
+		if !validCookieName(s.cookieName) {
+			return nil, fmt.Errorf("http-knock: cookieName %q is not a valid cookie name", s.cookieName)
+		}
+		if strings.HasPrefix(s.cookieName, "__Host-") && !s.cookieSecure {
+			return nil, errors.New("http-knock: a __Host- cookie requires cookieSecure: true")
+		}
+		if s.cookieSameSite == http.SameSiteNoneMode && !s.cookieSecure {
+			return nil, errors.New("http-knock: cookieSameSite None requires cookieSecure: true")
+		}
+
+		// A session secret is mandatory only when sessions are issued/accepted
+		// (grantMode session or both). In grantMode ip nothing is signed, but a
+		// secret that the operator did provide is still validated so a future
+		// switch to session mode cannot silently run with a weak value.
+		providedSecret := c.CookieSecret != "" || c.CookieSecretFile != "" || c.CookieSecretEnv != ""
+		if needSessionSecret || providedSecret {
+			secret, err := loadSecret(c.CookieSecret, c.CookieSecretFile, c.CookieSecretEnv, "cookieSecret")
+			if err != nil {
+				return nil, err
+			}
+			if len(secret) < minCookieSecretLength {
+				return nil, fmt.Errorf("http-knock: cookieSecret must be at least %d bytes", minCookieSecretLength)
+			}
+			s.cookieSecret = secret
+		}
 	}
 
 	s.forwardUserHeader = http.CanonicalHeaderKey(strings.TrimSpace(c.ForwardUserHeader))
@@ -581,7 +631,7 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 	if c.PrivateResponses != nil {
 		s.privateResponses = *c.PrivateResponses
 	} else {
-		s.privateResponses = s.authMode != AuthModePath
+		s.privateResponses = true
 	}
 
 	return s, nil
@@ -1194,11 +1244,16 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 func (m *middleware) handleLogout(rw http.ResponseWriter, req *http.Request) {
 	ip, _ := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	var tokens []string
-	if cookieToken, ok := m.sessionCookie(req); ok {
-		tokens = append(tokens, cookieToken)
-	}
-	if bearer, ok := bearerToken(req); ok && (len(tokens) == 0 || tokens[0] != bearer) {
-		tokens = append(tokens, bearer)
+	// Session tokens only exist when session grants are enabled. A secret can
+	// still be configured in grantMode ip (to revoke sessions left by an older
+	// configuration), but without one there is nothing this mode can parse.
+	if m.cfg.sessionGrantsEnabled() || len(m.cfg.cookieSecret) > 0 {
+		if cookieToken, ok := m.sessionCookie(req); ok {
+			tokens = append(tokens, cookieToken)
+		}
+		if bearer, ok := bearerToken(req); ok && (len(tokens) == 0 || tokens[0] != bearer) {
+			tokens = append(tokens, bearer)
+		}
 	}
 
 	var deleteErr error

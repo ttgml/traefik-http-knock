@@ -1,0 +1,24 @@
+# Static configuration for the CI/local end-to-end smoke test.
+#
+# The credentials below are development placeholders only. The test is driven
+# by .github/scripts/e2e-compose.sh.
+entryPoints:
+  path:
+    address: ":8000"
+  password:
+    address: ":8001"
+  basic:
+    address: ":8002"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true
+
+experimental:
+  localPlugins:
+    httpKnock:
+      moduleName: github.com/ttgml/traefik-http-knock
+
+log:
+  level: INFO

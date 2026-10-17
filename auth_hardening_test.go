@@ -226,6 +226,57 @@ func TestEndpointPathRejectsUnsafeValues(t *testing.T) {
 	}
 }
 
+func TestPasswordIPGrantWithoutCookieSecret(t *testing.T) {
+	srv := startFakeRedis(t)
+
+	cfg := CreateConfig()
+	cfg.KnockPath = testKnockPath
+	cfg.RedisAddr = srv.addr()
+	cfg.AuthMode = AuthModePassword
+	cfg.GrantMode = GrantModeIP
+	cfg.Realm = "test"
+	cfg.Users = []User{{Username: "alice", Password: "correct horse"}}
+	// grantMode ip issues no session/token, so no cookieSecret is required.
+
+	backend := &recordingBackend{}
+	handler, err := New(context.Background(), backend, cfg, "test")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		if closer, ok := handler.(interface{ Close() error }); ok {
+			_ = closer.Close()
+		}
+	})
+
+	login := httptest.NewRecorder()
+	handler.ServeHTTP(login, loginRequest("alice", "correct horse", "10.2.0.20:1234"))
+	if login.Code != http.StatusNoContent {
+		t.Fatalf("login status = %d, want 204", login.Code)
+	}
+	if cookies := login.Result().Cookies(); len(cookies) != 0 {
+		t.Fatalf("grantMode ip must not set cookies, got %v", cookies)
+	}
+
+	protected := httptest.NewRecorder()
+	handler.ServeHTTP(protected, newRequest(http.MethodGet, "https://example.com/private", "10.2.0.20:1234"))
+	if protected.Code != http.StatusOK {
+		t.Fatalf("IP-granted request status = %d, want 200", protected.Code)
+	}
+
+	logout := httptest.NewRecorder()
+	handler.ServeHTTP(logout, logoutRequest("10.2.0.20:1234", "", ""))
+	if logout.Code != http.StatusSeeOther {
+		t.Fatalf("logout status = %d, want 303", logout.Code)
+	}
+
+	after := httptest.NewRecorder()
+	handler.ServeHTTP(after, newRequest(http.MethodGet, "https://example.com/private", "10.2.0.20:1234"))
+	if after.Code != http.StatusForbidden {
+		t.Fatalf("status after logout = %d, want 403", after.Code)
+	}
+}
+
 func TestPathIPGrantRequiresLegacyMarker(t *testing.T) {
 	handler, backend, srv := newHarness(t, nil)
 	ip := "10.2.0.7"

@@ -1,0 +1,89 @@
+# Dynamic configuration for the CI/local end-to-end smoke test: one router per
+# auth mode, all proxying to whoami. Credentials are development placeholders.
+http:
+  routers:
+    whoami-path:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - path
+      middlewares:
+        - http-knock-path
+      service: whoami
+
+    whoami-password:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - password
+      middlewares:
+        - http-knock-password
+      service: whoami
+
+    whoami-basic:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - basic
+      middlewares:
+        - http-knock-basic
+      service: whoami
+
+  middlewares:
+    http-knock-path:
+      plugin:
+        httpKnock:
+          knockPath: "/__knock__/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          ttl: "2h"
+          redisAddr: "redis:6379"
+          redisPassword: "devpassword"
+          keyPrefix: "traefik:http-knock:"
+          failClosed: true
+          privateResponses: true
+          logClientIP: true
+
+    http-knock-password:
+      plugin:
+        httpKnock:
+          knockPath: "/__knock__"
+          loginPath: "/__knock__"
+          authMode: password
+          redirectURL: "/"
+          grantMode: session
+          sessionTTL: "12h"
+          # 120,000 iterations are deliberate here: they keep the smoke test
+          # fast and also exercise hashes created with the old default.
+          users:
+            - username: alice
+              passwordHash: "pbkdf2-sha256$120000$meLQaHL4/orKwUV0C4hW6w==$YIBFHpNWufILHzdjvLNixS3zbjr5ayZtRQQ2mMiZdWg="
+            - username: bob
+              passwordHash: "pbkdf2-sha256$120000$3dTiXqo1VzyJiHu7PNAuoQ==$wzKAfUtADkSzIgUoF9oMGLobgh0DVeVCx633l93UUnI="
+          # Development value; the local demo is HTTP-only.
+          cookieSecret: "vKm03+ijMmuczwTlqaYvZ3dsjd0eyJuukBWBdGGZuxU="
+          cookieSecure: false
+          cookieSameSite: "Lax"
+          realm: "e2e-password"
+          maxLoginAttempts: 5
+          loginWindow: "15m"
+          maxConcurrentLogins: 4
+          privateResponses: true
+          redisAddr: "redis:6379"
+          redisPassword: "devpassword"
+          keyPrefix: "traefik:http-knock:"
+          failClosed: true
+          logClientIP: true
+
+    http-knock-basic:
+      plugin:
+        httpKnock:
+          knockPath: "/__knock__"
+          authMode: basic
+          users:
+            - username: alice
+              passwordHash: "pbkdf2-sha256$120000$meLQaHL4/orKwUV0C4hW6w==$YIBFHpNWufILHzdjvLNixS3zbjr5ayZtRQQ2mMiZdWg="
+          privateResponses: true
+          maxConcurrentLogins: 4
+          logClientIP: true
+
+  services:
+    whoami:
+      loadBalancer:
+        servers:
+          - url: "http://whoami:80"

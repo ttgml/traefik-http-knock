@@ -22,9 +22,12 @@ metadata:
 spec:
   valuesContent: |-
     # ---------------------------------------------------------------- Option A
+    # v0.3.0 is the first release with password/Basic support. Until that image
+    # is published, build it locally from main and push it with this tag (or
+    # change the tag to your own image).
     image:
       repository: ghcr.io/ttgml/traefik-http-knock
-      tag: v0.2.0
+      tag: v0.3.0
       pullPolicy: IfNotPresent
     additionalArguments:
       - "--experimental.localPlugins.httpKnock.moduleName=github.com/ttgml/traefik-http-knock"

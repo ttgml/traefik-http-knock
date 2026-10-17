@@ -24,6 +24,7 @@ http:
           readTimeout: "1s"
           writeTimeout: "1s"
           redisPoolSize: 16
+          privateResponses: true
           logClientIP: true
 
   services:

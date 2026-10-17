@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-// testKnockPath is a 43 character path with a 128-bit-ish random secret. It
-// only exists in tests.
+// testKnockPath is a 43-byte ASCII path: the "/__knock__/" prefix plus 32 hex
+// characters (128 bits of test secret). It only exists in tests.
 const testKnockPath = "/__knock__/0123456789abcdef0123456789abcdef"
 
 // testKey is the realm-scoped Redis key used by the test harness (name "test").
@@ -111,6 +111,9 @@ func TestCreateConfigDefaults(t *testing.T) {
 	}
 	if cfg.FailClosed == nil || !*cfg.FailClosed {
 		t.Fatal("failClosed must default to true")
+	}
+	if cfg.PrivateResponses == nil || !*cfg.PrivateResponses {
+		t.Fatal("privateResponses must default to true")
 	}
 	if cfg.LogClientIP {
 		t.Fatal("logClientIP must default to false")

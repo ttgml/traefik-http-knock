@@ -44,9 +44,9 @@ const (
 //
 //	users:
 //	  - username: alice
-//	    passwordHash: "pbkdf2-sha256$120000$...$..."
+//	    passwordHash: "pbkdf2-sha256$600000$...$..."
 //	  - username: bob
-//	    passwordHash: "pbkdf2-sha256$120000$...$..."
+//	    passwordHash: "pbkdf2-sha256$600000$...$..."
 //
 // Username may be empty for a shared password. Password may be set instead of
 // PasswordHash for local development/tests; production deployments should use
@@ -324,9 +324,11 @@ func loadSecret(inline, file, envName, field string) ([]byte, error) {
 }
 
 // cookieNameFor derives a cookie name from the realm so multiple middlewares
-// on the same host do not overwrite each other's cookie.
+// on the same host do not overwrite each other's cookie. The suffix is a
+// 64-bit digest, which makes an accidental collision between unrelated
+// middlewares on one host very unlikely.
 func cookieNameFor(realm string, secure bool) string {
-	suffix := sha256Hex(realm)[:8]
+	suffix := sha256Hex(realm)[:16]
 	if secure {
 		return "__Host-http-knock-" + suffix
 	}

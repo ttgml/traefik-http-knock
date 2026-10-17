@@ -1,9 +1,9 @@
 # Modules
 MODULE              ?= github.com/ttgml/traefik-http-knock
-TRAEFIK_VERSION     ?= v3.2
+TRAEFIK_VERSION     ?= v3.2.5
 IMAGE               ?= ghcr.io/ttgml/traefik-http-knock
-TAG                 ?= v0.2.0
-PLUGIN_VERSION      ?= v0.2.0
+TAG                 ?= v0.3.0
+PLUGIN_VERSION      ?= v0.3.0
 # The plugin ConfigMap must live in the same namespace as the Traefik pod.
 K8S_NAMESPACE       ?= kube-system
 PLUGIN_CONFIGMAP    ?= http-knock-plugin
@@ -17,6 +17,7 @@ PLUGIN_SOURCES = go.mod .traefik.yml knock.go ip.go redis.go auth.go crypto.go r
 help:
 	@echo "Targets:"
 	@echo "  fmt vet test race check      local quality gates"
+	@echo "  e2e                          Traefik + Yaegi + Redis compose smoke test"
 	@echo "  tidy                         go mod tidy"
 	@echo "  docker-build                 build the Traefik image with the plugin"
 	@echo "  compose-up compose-down      local Traefik + Redis + whoami demo"
@@ -45,6 +46,10 @@ test:
 .PHONY: race
 race:
 	$(GO) test -race ./...
+
+.PHONY: e2e
+e2e:
+	bash .github/scripts/e2e-compose.sh
 
 .PHONY: check
 check:

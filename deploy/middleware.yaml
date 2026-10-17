@@ -39,8 +39,10 @@ spec:
       clientIPHeader: ""
 
       # Optional. IPs and CIDR ranges that are always allowed: no knock and no
-      # Redis lookup (so they keep working during a Redis outage). Single IPs
-      # or CIDR ranges, IPv4 or IPv6. Empty means only knocks grant access.
+      # Redis lookup (so they keep working during a Redis outage). In password
+      # and Basic mode a match also bypasses authentication entirely, so only
+      # list networks you fully trust. Single IPs or CIDR ranges, IPv4 or IPv6.
+      # Empty means only knocks grant access.
       staticAllowlist: []
       #  - "203.0.113.7"
       #  - "192.168.0.0/16"
@@ -53,6 +55,9 @@ spec:
       readTimeout: "1s"
       writeTimeout: "1s"
       redisPoolSize: 16
+
+      # Prevent a shared cache/CDN from storing an authorized response.
+      privateResponses: true
 
       # Client IPs stay out of the logs unless you opt in.
       logClientIP: false

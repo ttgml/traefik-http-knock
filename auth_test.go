@@ -21,6 +21,7 @@ func newPasswordHarness(t *testing.T, mutate func(*Config)) (http.Handler, *reco
 	cfg.KnockPath = testKnockPath
 	cfg.RedisAddr = srv.addr()
 	cfg.AuthMode = AuthModePassword
+	cfg.Realm = "test"
 	cfg.Users = []User{{Username: "alice", Password: "correct horse"}}
 	cfg.CookieSecret = testCookieSecret
 	cfg.CookieName = "http-knock-test"
@@ -211,8 +212,13 @@ func TestPasswordLoginIPGrantMode(t *testing.T) {
 	if cookieFrom(rec, cfg.CookieName) != nil {
 		t.Fatal("grantMode ip must not issue a session cookie for an HTML login")
 	}
-	if !srv.get(ipGrantKey(DefaultKeyPrefix, "test", "10.1.0.4")) {
+	m := handler.(*middleware)
+	value, ok := srv.getValue(ipGrantKey(DefaultKeyPrefix, "test", "10.1.0.4"))
+	if !ok {
 		t.Fatalf("missing IP grant, commands: %v", srv.recordedCommands())
+	}
+	if want := sessionValue(m.cfg.users.byName["alice"]); value != want {
+		t.Fatalf("IP grant value = %q, want credential fingerprint %q", value, want)
 	}
 
 	allowed := httptest.NewRecorder()
@@ -464,6 +470,11 @@ func TestLoginPageAndLogoutForm(t *testing.T) {
 	}
 	if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
 		t.Fatalf("X-Frame-Options = %q, want DENY", got)
+	}
+	// Chrome sends "Origin: null" on the login form POST when the page uses
+	// "no-referrer"; sameOriginPost would reject that as cross-origin.
+	if got := rec.Header().Get("Referrer-Policy"); got != "same-origin" {
+		t.Fatalf("Referrer-Policy = %q, want same-origin", got)
 	}
 }
 
@@ -846,11 +857,24 @@ func TestAuthConfigDefaults(t *testing.T) {
 	if s.grantMode != GrantModeIP {
 		t.Fatalf("path-mode grantMode = %q, want ip", s.grantMode)
 	}
-	if s.realm != "my-middleware" {
-		t.Fatalf("realm = %q, want my-middleware", s.realm)
+	if s.realm == "my-middleware" || !strings.HasPrefix(s.realm, "my-middleware-") {
+		t.Fatalf("realm = %q, want a name plus a configuration digest", s.realm)
 	}
 	if s.privateResponses {
 		t.Fatal("path mode must default privateResponses to false for backward compatibility")
+	}
+
+	// Two configurations that share a middleware name but not their endpoint
+	// configuration must not share default realm-scoped IP grants.
+	otherCfg := CreateConfig()
+	otherCfg.KnockPath = testKnockPath + "x"
+	otherCfg.RedisAddr = "redis:6379"
+	otherSettings, err := otherCfg.settingsFor("my-middleware")
+	if err != nil {
+		t.Fatalf("other settingsFor: %v", err)
+	}
+	if otherSettings.realm == s.realm {
+		t.Fatalf("different knockPath produced the same realm %q", s.realm)
 	}
 
 	passwordCfg := CreateConfig()

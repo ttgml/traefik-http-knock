@@ -5,6 +5,9 @@ deploy/plugin-configmap.yaml
 *.local.yaml
 *.local.yml
 
+# Local three-mode test environment (docker-compose.local.yml + .local-test/)
+.local-test/
+
 # Editors / OS
 .DS_Store
 .idea/

@@ -50,6 +50,42 @@ func TestRedisTTLSeconds(t *testing.T) {
 	}
 }
 
+func TestRedisSetNXEx(t *testing.T) {
+	srv := startFakeRedis(t)
+	client := newTestRedisClient(t, srv.addr())
+
+	key := loginFailureKey(DefaultKeyPrefix, "test", "203.0.113.9")
+	created, err := client.setNXEx(key, "0", time.Minute)
+	if err != nil {
+		t.Fatalf("setNXEx first: %v", err)
+	}
+	if !created {
+		t.Fatal("first SET NX EX must create the key")
+	}
+
+	created, err = client.setNXEx(key, "9", time.Minute)
+	if err != nil {
+		t.Fatalf("setNXEx second: %v", err)
+	}
+	if created {
+		t.Fatal("SET NX EX must not overwrite an existing key")
+	}
+	value, ok, err := client.getValue(key)
+	if err != nil || !ok || value != "0" {
+		t.Fatalf("value after second setNXEx = %q, ok=%v, err=%v", value, ok, err)
+	}
+
+	// After the TTL the key can be created again.
+	srv.expireAll()
+	created, err = client.setNXEx(key, "0", time.Minute)
+	if err != nil {
+		t.Fatalf("setNXEx after expiry: %v", err)
+	}
+	if !created {
+		t.Fatal("SET NX EX must create the key after expiry")
+	}
+}
+
 func TestRedisSetExAndExists(t *testing.T) {
 	srv := startFakeRedis(t)
 	client := newTestRedisClient(t, srv.addr())
@@ -346,6 +382,27 @@ func TestRedisIntegrationTTL(t *testing.T) {
 	}
 	if !allowed {
 		t.Fatal("key must exist after the knock")
+	}
+
+	// SET NX EX is used by the login attempt limiter; exercise it against the
+	// real server as well as the fake one.
+	nxKey := loginFailureKey("traefik:http-knock:itest:", "itest", "203.0.113.8")
+	created, err := client.setNXEx(nxKey, "0", time.Minute)
+	if err != nil {
+		t.Fatalf("setNXEx: %v", err)
+	}
+	if !created {
+		t.Fatal("setNXEx must create a missing key")
+	}
+	created, err = client.setNXEx(nxKey, "9", time.Minute)
+	if err != nil {
+		t.Fatalf("setNXEx second: %v", err)
+	}
+	if created {
+		t.Fatal("setNXEx must not overwrite an existing key")
+	}
+	if err := client.del(nxKey); err != nil {
+		t.Fatalf("del nx key: %v", err)
 	}
 
 	reply, err := client.do("TTL", key)

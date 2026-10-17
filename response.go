@@ -26,19 +26,53 @@ func newPrivateResponseWriter(rw http.ResponseWriter) *privateResponseWriter {
 }
 
 func (w *privateResponseWriter) applyPrivateHeaders() {
-	header := w.ResponseWriter.Header()
-	header.Set("Cache-Control", "private")
+	applyPrivateHeaders(w.ResponseWriter.Header())
+}
+
+// applyPrivateHeaders marks a response as non-shared-cacheable. It preserves an
+// explicit "no-store" from the backend: private is weaker than no-store, and
+// overwriting it would make a sensitive response browser-cacheable.
+func applyPrivateHeaders(header http.Header) {
+	if !hasNoStore(header) {
+		header.Set("Cache-Control", "private")
+	}
 	addVary(header, "Cookie")
 	addVary(header, "Authorization")
 }
 
+func hasNoStore(header http.Header) bool {
+	for _, value := range header.Values("Cache-Control") {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), "no-store") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (w *privateResponseWriter) WriteHeader(statusCode int) {
+	// 1xx responses other than 101 are informational and do not commit the
+	// response. Passing them through without setting wroteHeader keeps the
+	// wrapper from dropping the backend's final status.
+	if statusCode >= 100 && statusCode < 200 && statusCode != http.StatusSwitchingProtocols {
+		w.ResponseWriter.WriteHeader(statusCode)
+		return
+	}
 	if w.wroteHeader {
 		return
 	}
 	w.wroteHeader = true
 	w.applyPrivateHeaders()
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// finish applies the private headers when the backend returned without writing
+// anything. The server still sends an implicit 200 using these headers.
+func (w *privateResponseWriter) finish() {
+	if !w.wroteHeader {
+		w.applyPrivateHeaders()
+	}
 }
 
 func (w *privateResponseWriter) Write(body []byte) (int, error) {

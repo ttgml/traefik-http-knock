@@ -328,6 +328,23 @@ func (c *redisClient) setEx(key, value string, ttl time.Duration) error {
 	return fmt.Errorf("redis: unexpected SET reply %q", describeKind(reply))
 }
 
+// setNXEx implements SET key value EX seconds NX. The boolean is false when the
+// key already exists and nothing was written. SET NX is idempotent, so the
+// first-attempt retry in doIdempotent is safe.
+func (c *redisClient) setNXEx(key, value string, ttl time.Duration) (bool, error) {
+	reply, err := c.doIdempotent("SET", key, value, "EX", strconv.FormatInt(redisTTLSeconds(ttl), 10), "NX")
+	if err != nil {
+		return false, err
+	}
+	if reply.kind == respBulkString && reply.isNil {
+		return false, nil
+	}
+	if reply.kind == respSimpleString && reply.str == "OK" {
+		return true, nil
+	}
+	return false, fmt.Errorf("redis: unexpected SET NX reply %q", describeKind(reply))
+}
+
 // getValue implements GET key. The boolean is false for a nil reply (key absent).
 func (c *redisClient) getValue(key string) (string, bool, error) {
 	reply, err := c.doIdempotent("GET", key)

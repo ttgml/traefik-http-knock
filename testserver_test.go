@@ -232,6 +232,7 @@ func (s *fakeRedisServer) handle(conn net.Conn) {
 				continue
 			}
 			expiry := time.Time{}
+			nx := false
 			for i := 3; i < len(args); i++ {
 				switch strings.ToUpper(args[i]) {
 				case "EX":
@@ -250,10 +251,16 @@ func (s *fakeRedisServer) handle(conn net.Conn) {
 					ms, _ := strconv.Atoi(args[i+1])
 					expiry = time.Now().Add(time.Duration(ms) * time.Millisecond)
 					i++
+				case "NX":
+					nx = true
 				default:
 					_ = writeError(w, "ERR syntax error")
 					continue
 				}
+			}
+			if nx && s.get(args[1]) {
+				_ = writeNil(w)
+				continue
 			}
 			s.set(args[1], args[2], expiry)
 			_ = writeSimple(w, "OK")

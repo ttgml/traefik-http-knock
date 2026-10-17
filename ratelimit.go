@@ -1,57 +1,42 @@
 package traefik_http_knock
 
-import (
-	"fmt"
-	"strconv"
-)
-
-// loginFailureKey is the Redis key for failed password attempts from one IP.
+// loginFailureKey is the Redis key for login attempts from one IP.
 // The realm keeps counters isolated between middleware instances that share a
 // Redis database.
 func loginFailureKey(prefix, realm, clientIP string) string {
 	return scopedKey(prefix, realm, "login", clientIP)
 }
 
-// loginAllowed reports whether the client may attempt a password login. A
-// Redis failure is returned to the caller so the login path can fail closed:
-// without the counter, rate limiting cannot be guaranteed.
-func (m *middleware) loginAllowed(clientIP string) (bool, error) {
+// reserveLoginAttempt counts one login attempt and reports whether the client
+// may continue. Counting before password verification avoids the check-then-
+// increment race that let a concurrent burst exceed maxLoginAttempts.
+//
+// The counter is created with SET NX EX, so it has a TTL from the first
+// attempt. Every attempt refreshes that TTL; if EXPIRE fails anyway the key is
+// deleted, because a counter without a TTL would lock the IP out forever once it
+// reaches the limit. A successful login deletes the counter.
+func (m *middleware) reserveLoginAttempt(clientIP string) (bool, error) {
 	if m.cfg.maxLoginAttempts <= 0 {
 		return true, nil
 	}
-	value, ok, err := m.redis.getValue(loginFailureKey(m.cfg.keyPrefix, m.cfg.realm, clientIP))
+
+	key := loginFailureKey(m.cfg.keyPrefix, m.cfg.realm, clientIP)
+	if _, err := m.redis.setNXEx(key, "0", m.cfg.loginWindow); err != nil {
+		return false, err
+	}
+
+	count, err := m.redis.incr(key)
 	if err != nil {
 		return false, err
 	}
-	if !ok {
-		return true, nil
+	if err := m.redis.expire(key, m.cfg.loginWindow); err != nil {
+		// A TTL-less counter is worse than losing the failure count: delete it
+		// so the client is not locked out permanently.
+		_ = m.redis.del(key)
+		return false, err
 	}
-	count, err := strconv.Atoi(value)
-	if err != nil {
-		// A malformed counter must not turn into an unlimited login window.
-		return false, fmt.Errorf("http-knock: invalid login counter value")
-	}
-	return count < m.cfg.maxLoginAttempts, nil
-}
 
-// recordLoginFailure increments the per-IP failure counter. INCR is not
-// idempotent, so it uses do() instead of doIdempotent(); a retry could otherwise
-// count the same failure twice.
-func (m *middleware) recordLoginFailure(clientIP string) error {
-	if m.cfg.maxLoginAttempts <= 0 {
-		return nil
-	}
-	key := loginFailureKey(m.cfg.keyPrefix, m.cfg.realm, clientIP)
-	count, err := m.redis.incr(key)
-	if err != nil {
-		return err
-	}
-	if count == 1 {
-		if err := m.redis.expire(key, m.cfg.loginWindow); err != nil {
-			return err
-		}
-	}
-	return nil
+	return count <= int64(m.cfg.maxLoginAttempts), nil
 }
 
 func (m *middleware) clearLoginFailures(clientIP string) error {

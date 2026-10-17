@@ -43,7 +43,7 @@ const (
 // The salt and hash use standard base64 (with padding) so the value stays a
 // single printable field in YAML, a credentials file or a Secret.
 func HashPassword(password string, iterations int) (string, error) {
-	if iterations <= 0 {
+	if iterations == 0 {
 		iterations = DefaultPBKDF2Iterations
 	}
 	if iterations < minPBKDF2Iterations {

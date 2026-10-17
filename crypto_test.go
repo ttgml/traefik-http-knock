@@ -46,6 +46,9 @@ func TestHashPasswordRejectsBadInput(t *testing.T) {
 	if _, err := HashPassword("x", 1); err == nil {
 		t.Fatal("expected an error for too few iterations")
 	}
+	if _, err := HashPassword("x", -1); err == nil {
+		t.Fatal("expected an error for a negative iteration count")
+	}
 }
 
 func TestParsePasswordHashRejectsMalformedValues(t *testing.T) {

@@ -90,15 +90,7 @@ test-integration:
 .PHONY: k8s-plugin-configmap
 k8s-plugin-configmap:
 	kubectl create configmap $(PLUGIN_CONFIGMAP) -n $(K8S_NAMESPACE) \
-		--from-file=go.mod \
-		--from-file=.traefik.yml \
-		--from-file=knock.go \
-		--from-file=ip.go \
-		--from-file=redis.go \
-		--from-file=auth.go \
-		--from-file=crypto.go \
-		--from-file=ratelimit.go \
-		--from-file=response.go \
+		$(foreach src,$(PLUGIN_SOURCES),--from-file=$(src)) \
 		--dry-run=client -o yaml \
 		> deploy/plugin-configmap.yaml
 	@echo "wrote deploy/plugin-configmap.yaml (namespace $(K8S_NAMESPACE))"

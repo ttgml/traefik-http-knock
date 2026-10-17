@@ -12,7 +12,8 @@ ARG PLUGIN_MODULE=github.com/ttgml/traefik-http-knock
 
 COPY go.mod /plugins-local/src/${PLUGIN_MODULE}/go.mod
 COPY .traefik.yml /plugins-local/src/${PLUGIN_MODULE}/.traefik.yml
-COPY knock.go ip.go redis.go auth.go crypto.go ratelimit.go response.go /plugins-local/src/${PLUGIN_MODULE}/
+# .dockerignore excludes *_test.go, so this copies every plugin source file.
+COPY *.go /plugins-local/src/${PLUGIN_MODULE}/
 
 # Static configuration used when the image is run standalone. On k3s the
 # traefik chart mounts its own configuration file over this path, and the local

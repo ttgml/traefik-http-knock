@@ -88,7 +88,10 @@ func normalizeIP(raw string) (string, error) {
 
 	ip := net.ParseIP(raw)
 	if ip == nil {
-		return "", fmt.Errorf("%w: %q is not a valid IP address", errNoClientIP, raw)
+		// Do not include raw in the error: it can be an attacker-supplied
+		// clientIPHeader value, and this error is logged even when
+		// logClientIP is false.
+		return "", fmt.Errorf("%w: value is not a valid IP address", errNoClientIP)
 	}
 	return ip.String(), nil
 }

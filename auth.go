@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -227,7 +229,34 @@ func (s *userSet) authenticate(username, password string) (*userCredential, bool
 	if matched != nil {
 		return matched, true
 	}
+
+	// With no shared credential there was no PBKDF2 work above. Run one dummy
+	// derivation with the configured iteration count so an unknown/empty
+	// username is not distinguishable from a known user with a wrong password
+	// by response time. (With shared credentials the loop already did KDF work.)
+	if len(s.shared) == 0 {
+		s.dummyVerify(password)
+	}
 	return nil, false
+}
+
+// dummyVerify performs the same key-derivation work as a real hash check but
+// discards the result. It is used only to flatten the timing difference for
+// unknown usernames.
+func (s *userSet) dummyVerify(password string) {
+	iterations := 0
+	for _, user := range s.all {
+		if user.hash != nil {
+			iterations = user.hash.iterations
+			break
+		}
+	}
+	if iterations == 0 {
+		// Plaintext-only development configuration: a wrong password check is
+		// constant-time and cheap, so there is no expensive work to mimic.
+		return
+	}
+	_ = pbkdf2SHA256([]byte(password), []byte("http-knock-dummy-salt"), iterations, pbkdf2KeyLength)
 }
 
 // findByFingerprint resolves the user stored in a session value. The
@@ -271,22 +300,22 @@ func parseSessionValue(value string) (string, string, bool) {
 }
 
 // loadSecret resolves a secret from a file, environment variable or inline
-// value, in that order of precedence.
+// value, in that order of precedence. A configured higher-priority source is
+// authoritative: an unset environment variable does not mask a valid file.
 func loadSecret(inline, file, envName, field string) ([]byte, error) {
 	value := strings.TrimSpace(inline)
-	if envName != "" {
-		envValue, ok := os.LookupEnv(envName)
-		if !ok || strings.TrimSpace(envValue) == "" {
-			return nil, fmt.Errorf("http-knock: %s environment variable %q is empty or not set", field, envName)
-		}
-		value = strings.TrimSpace(envValue)
-	}
 	if file != "" {
 		data, err := os.ReadFile(file)
 		if err != nil {
 			return nil, fmt.Errorf("http-knock: cannot read %s: %w", field, err)
 		}
 		value = strings.TrimSpace(string(data))
+	} else if envName != "" {
+		envValue, ok := os.LookupEnv(envName)
+		if !ok || strings.TrimSpace(envValue) == "" {
+			return nil, fmt.Errorf("http-knock: %s environment variable %q is empty or not set", field, envName)
+		}
+		value = strings.TrimSpace(envValue)
 	}
 	if value == "" {
 		return nil, fmt.Errorf("http-knock: %s must not be empty", field)
@@ -404,6 +433,99 @@ func hasAuthorization(req *http.Request) bool {
 	return strings.TrimSpace(req.Header.Get("Authorization")) != ""
 }
 
+// sameOriginPost rejects cross-origin login and logout POSTs. A cross-site HTML
+// form can make a victim's browser submit attacker credentials (login CSRF) or
+// log the victim out; SameSite cookies do not prevent either, because the
+// response can still set/clear cookies and the handler runs server-side.
+//
+// Modern browsers send Sec-Fetch-Site, Origin or Referer on form POSTs. Requests
+// from non-browser clients usually send none of them and are allowed; the
+// protected state changes still require valid credentials or a valid token.
+func sameOriginPost(req *http.Request) bool {
+	if site := strings.ToLower(strings.TrimSpace(req.Header.Get("Sec-Fetch-Site"))); site != "" {
+		if site != "same-origin" && site != "none" {
+			return false
+		}
+	}
+	if origin := strings.TrimSpace(req.Header.Get("Origin")); origin != "" {
+		return sameOriginURL(req, origin)
+	}
+	if referer := strings.TrimSpace(req.Header.Get("Referer")); referer != "" {
+		return sameOriginURL(req, referer)
+	}
+	return true
+}
+
+// sameOriginURL compares the scheme/host of an Origin or Referer value with the
+// request authority, including the default port for the scheme.
+func sameOriginURL(req *http.Request, raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	scheme := requestScheme(req)
+	if !strings.EqualFold(u.Scheme, scheme) {
+		return false
+	}
+
+	originHost := strings.ToLower(u.Host)
+	requestHost := strings.ToLower(req.Host)
+	if originHost == requestHost {
+		return true
+	}
+
+	originName, originPort := splitAuthority(originHost)
+	requestName, requestPort := splitAuthority(requestHost)
+	if originName != requestName {
+		return false
+	}
+	if originPort == "" {
+		originPort = defaultPort(u.Scheme)
+	}
+	if requestPort == "" {
+		requestPort = defaultPort(scheme)
+	}
+	return originPort == requestPort
+}
+
+// requestScheme returns the scheme the client used. Traefik normally sets TLS
+// itself for HTTPS entrypoints; X-Forwarded-Proto covers a TLS-terminating
+// proxy in front of Traefik.
+func requestScheme(req *http.Request) string {
+	if req.TLS != nil {
+		return "https"
+	}
+	if proto := req.Header.Get("X-Forwarded-Proto"); proto != "" {
+		if i := strings.IndexByte(proto, ','); i >= 0 {
+			proto = proto[:i]
+		}
+		switch strings.ToLower(strings.TrimSpace(proto)) {
+		case "http":
+			return "http"
+		case "https":
+			return "https"
+		}
+	}
+	return "http"
+}
+
+func splitAuthority(host string) (string, string) {
+	if name, port, err := net.SplitHostPort(host); err == nil {
+		return strings.ToLower(name), port
+	}
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")), ""
+	}
+	return host, ""
+}
+
+func defaultPort(scheme string) string {
+	if strings.EqualFold(scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
 func wantsJSON(req *http.Request) bool {
 	if strings.Contains(strings.ToLower(req.Header.Get("Accept")), "application/json") {
 		return true
@@ -430,7 +552,13 @@ func (m *middleware) renderLoginPage(rw http.ResponseWriter, status int, message
 	rw.Header().Set("Cache-Control", "no-store")
 	rw.Header().Set("Pragma", "no-cache")
 	rw.Header().Set("X-Frame-Options", "DENY")
-	rw.Header().Set("Referrer-Policy", "no-referrer")
+	// Browsers apply the login page's referrer policy to the form submission
+	// that follows. Chrome sends "Origin: null" on a form POST when the page is
+	// served with "no-referrer", which sameOriginPost correctly rejects as a
+	// cross-origin attempt. "same-origin" keeps credentials out of cross-origin
+	// Referer headers while preserving a verifiable Origin on the same-origin
+	// login POST.
+	rw.Header().Set("Referrer-Policy", "same-origin")
 	rw.Header().Set("X-Content-Type-Options", "nosniff")
 	rw.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
 	rw.WriteHeader(status)

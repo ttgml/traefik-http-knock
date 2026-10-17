@@ -68,6 +68,7 @@ func newHarness(t *testing.T, mutate func(*Config)) (http.Handler, *recordingBac
 	srv := startFakeRedis(t)
 	cfg := CreateConfig()
 	cfg.KnockPath = testKnockPath
+	cfg.Realm = "test"
 	cfg.RedisAddr = srv.addr()
 	if mutate != nil {
 		mutate(cfg)

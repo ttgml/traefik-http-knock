@@ -63,10 +63,12 @@ const (
 // omitted.
 type Config struct {
 	// KnockPath is the exact path of the path-mode knock endpoint, for example
-	// "/__knock__/9c4e2e4e3b6d0c0f...". It must start with "/", must not
-	// contain "?" or "#", and must be between 6 and 80 characters long. In
-	// path mode it should embed a long random secret. In password mode it is
-	// used as the default login endpoint when LoginPath is empty.
+	// "/__knock__/9c4e2e4e3b6d0c0f...". It must start with "/", must not be
+	// protocol-relative or contain "?", "#", backslashes, percent-encoding,
+	// whitespace or control characters, and must be between 6 and 80
+	// characters long. In path mode it should embed a long random secret. In
+	// password mode it is used as the default login endpoint when LoginPath is
+	// empty.
 	KnockPath string `json:"knockPath,omitempty"`
 
 	// TTL is the lifetime of an IP grant, expressed as a Go duration ("90s",
@@ -95,7 +97,8 @@ type Config struct {
 	// RedisPassword is optional. Prefer injecting it from a Secret.
 	RedisPassword string `json:"redisPassword,omitempty"`
 
-	// RedisDB is the Redis logical database (0-15). Defaults to 0.
+	// RedisDB is the Redis logical database. Defaults to 0. Redis enables 0-15 by
+	// default; a higher value must also be enabled in the Redis server.
 	RedisDB int `json:"redisDB,omitempty"`
 
 	// KeyPrefix is prepended to every realm-scoped Redis key (IP grants,
@@ -151,15 +154,20 @@ type Config struct {
 	//
 	//   - "path" (default): the original GET <knockPath> secret-path knock.
 	//   - "password": a login form on LoginPath, session cookies and Bearer
-	//     session tokens. Basic auth is not accepted in this mode; use the
-	//     login endpoint to obtain a token for CLI/API clients.
+	//     session tokens (only for grantMode session/both). Basic auth is not
+	//     accepted in this mode; use the login endpoint to obtain a token for
+	//     CLI/API clients.
 	//   - "basic": HTTP Basic auth on every request. This mode is stateless
-	//     and does not use Redis for access decisions.
+	//     and does not use Redis for access decisions. Each request performs a
+	//     password verification, so it is CPU-bound and has no login rate
+	//     limit (only the MaxConcurrentLogins bound); use it behind a Traefik
+	//     rateLimit middleware and preferably on a trusted network.
 	AuthMode string `json:"authMode,omitempty"`
 
 	// GrantMode controls what a successful password login grants:
 	//
 	//   - "ip": the client IP is stored in Redis (NAT users share access).
+	//     Sessions/Bearer tokens are neither issued nor accepted.
 	//   - "session": a Redis-backed session cookie/token is issued.
 	//   - "both": both of the above; either grant allows the request.
 	//   - "none": no grant (used by basic auth).
@@ -170,12 +178,17 @@ type Config struct {
 
 	// LoginPath is the password login endpoint. It defaults to KnockPath in
 	// password mode. GET/HEAD render the login page, POST logs in, and a POST
-	// with action=logout revokes the current session.
+	// with action=logout revokes the current session. It must be a plain
+	// absolute path: protocol-relative ("//host"), backslashes, percent-
+	// encoding, whitespace and control characters are rejected.
 	LoginPath string `json:"loginPath,omitempty"`
 
-	// Realm scopes Redis keys and signed session tokens to one middleware.
-	// It defaults to the Traefik middleware name, so two middlewares sharing a
-	// Redis database cannot grant access to each other.
+	// Realm scopes Redis keys, cookies and signed session tokens to one
+	// middleware configuration. It defaults to the middleware name plus a short
+	// digest of the auth endpoints, so same-named middlewares with different
+	// endpoints do not share grants. Set it explicitly to keep keys stable
+	// across configuration changes and whenever several deployments share the
+	// same Redis database and keyPrefix.
 	Realm string `json:"realm,omitempty"`
 
 	// Users contains inline password entries. Multiple users/passwords are
@@ -225,22 +238,25 @@ type Config struct {
 	// SessionTTL is the lifetime of a password session. It defaults to TTL.
 	SessionTTL string `json:"sessionTTL,omitempty"`
 
-	// MaxLoginAttempts is the number of failed password attempts allowed per
-	// client IP inside LoginWindow. It defaults to 5; 0 disables the limit.
+	// MaxLoginAttempts is the number of login attempts allowed per client IP
+	// inside LoginWindow. Every attempt counts before password verification;
+	// a successful login clears the counter. It defaults to 5; 0 disables the
+	// limit. Basic auth does not use this counter.
 	MaxLoginAttempts int `json:"maxLoginAttempts,omitempty"`
 
-	// LoginWindow is the failure-counter window. It defaults to 15m.
+	// LoginWindow is the login-attempt counter window. It defaults to 15m.
 	LoginWindow string `json:"loginWindow,omitempty"`
 
 	// MaxConcurrentLogins bounds concurrent password verifications per Traefik
-	// process, protecting CPU-intensive KDFs. It defaults to 4; 0 disables the
-	// limit.
+	// process for both the login form and Basic auth, protecting CPU-intensive
+	// KDFs. It defaults to 4; 0 disables the limit.
 	MaxConcurrentLogins int `json:"maxConcurrentLogins,omitempty"`
 
 	// PrivateResponses forces Cache-Control: private and Vary: Cookie,
 	// Authorization on protected responses, so a CDN cannot cache content
-	// authorized by a cookie/header and serve it to someone else. It defaults
-	// to true for password/basic mode and false for the legacy path mode.
+	// authorized by a cookie/header and serve it to someone else. A backend's
+	// stronger no-store directive is preserved. It defaults to true for
+	// password/basic mode and false for the legacy path mode.
 	PrivateResponses *bool `json:"privateResponses,omitempty"`
 
 	// ForwardUserHeader optionally forwards the authenticated username to the
@@ -308,6 +324,13 @@ type settings struct {
 	forwardUserHeader   string
 }
 
+// sessionGrantsEnabled reports whether this configuration accepts and issues
+// Redis-backed sessions. With grantMode "ip" only IP grants are valid, even if
+// a session token was created by an earlier configuration or a JSON login.
+func (s *settings) sessionGrantsEnabled() bool {
+	return s.grantMode == GrantModeSession || s.grantMode == GrantModeBoth
+}
+
 // Validate checks the configuration and returns a descriptive error when it is
 // unusable. It is safe to call on a Config returned by CreateConfig.
 func (c *Config) Validate() error {
@@ -316,7 +339,8 @@ func (c *Config) Validate() error {
 }
 
 // settings validates the configuration with the default realm. New() uses
-// settingsFor(name) so the realm defaults to the Traefik middleware name.
+// settingsFor(name) so the realm defaults to the middleware name plus an
+// endpoint digest.
 func (c *Config) settings() (*settings, error) {
 	return c.settingsFor("")
 }
@@ -324,6 +348,9 @@ func (c *Config) settings() (*settings, error) {
 // settingsFor validates the configuration, applies defaults for any zero value
 // that has one and returns the parsed result. name is the Traefik middleware
 // name and is used as the default realm.
+//
+// The integer limits MaxLoginAttempts and MaxConcurrentLogins are pre-filled by
+// CreateConfig; a Config built by hand gets 0, which disables those limits.
 func (c *Config) settingsFor(name string) (*settings, error) {
 	if c == nil {
 		return nil, errors.New("http-knock: config must not be nil")
@@ -402,10 +429,7 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 	}
 
 	if s.realm == "" {
-		s.realm = name
-	}
-	if s.realm == "" {
-		s.realm = "default"
+		s.realm = defaultRealm(name, s.authMode, s.knockPath, s.loginPath)
 	}
 	if !validRealm(s.realm) {
 		return nil, fmt.Errorf("http-knock: realm %q contains unsupported characters", s.realm)
@@ -573,8 +597,20 @@ func validateEndpointPath(field, value string, minLength int) error {
 	if !strings.HasPrefix(value, "/") {
 		return fmt.Errorf("http-knock: %s must start with %q", field, "/")
 	}
+	if strings.HasPrefix(value, "//") {
+		return fmt.Errorf("http-knock: %s must not be protocol-relative (start with %q)", field, "//")
+	}
 	if strings.ContainsAny(value, "?#") {
 		return fmt.Errorf("http-knock: %s must not contain a query or fragment", field)
+	}
+	// Reject characters that are ambiguous in URLs or HTTP headers. In
+	// particular a backslash is normalised to "/" by browsers (so "/\evil"
+	// becomes "//evil"), and percent-encoded paths never match req.URL.Path,
+	// which is decoded.
+	for _, r := range value {
+		if r <= 0x20 || r == 0x7f || r == '\\' || r == '%' {
+			return fmt.Errorf("http-knock: %s must not contain whitespace, control characters, backslashes or percent-encoding", field)
+		}
 	}
 	if strings.EqualFold(value, "/") {
 		return fmt.Errorf("http-knock: %s must not be \"/\"", field)
@@ -586,6 +622,22 @@ func validateEndpointPath(field, value string, minLength int) error {
 		return fmt.Errorf("http-knock: %s must be at most %d characters long", field, maxKnockPathLength)
 	}
 	return nil
+}
+
+// defaultRealm scopes Redis keys, cookies and signed tokens to one middleware
+// configuration. The middleware name alone can be identical in two deployments
+// that share Redis (for example separate clusters or providers that pass a bare
+// name), so a short digest of the endpoint configuration is appended. The digest
+// does not contain the endpoint values, but a deliberately weak path secret
+// could still be brute-forced by someone who can read Redis; use a 128-bit
+// random path. An explicit realm is still required to isolate deployments that
+// share both the name and the endpoints.
+func defaultRealm(name, authMode, knockPath, loginPath string) string {
+	if name == "" {
+		name = "default"
+	}
+	seed := authMode + "\x00" + knockPath + "\x00" + loginPath
+	return name + "-" + sha256Hex(seed)[:16]
 }
 
 func validRealm(realm string) bool {
@@ -846,7 +898,7 @@ func (m *middleware) handlePathProtected(rw http.ResponseWriter, req *http.Reque
 		return
 	}
 
-	allowed, err := m.redis.exists(ipGrantKey(m.cfg.keyPrefix, m.cfg.realm, ip))
+	allowed, err := m.ipGrantAllowed(ip)
 	if err != nil {
 		m.logf("redis unavailable for client %s: %v", m.clientLabel(ip), err)
 		m.writeRedisFailure(rw, req)
@@ -882,6 +934,18 @@ func (m *middleware) handleBasicProtected(rw http.ResponseWriter, req *http.Requ
 		m.writeBasicChallenge(rw)
 		return
 	}
+
+	// Every Basic request verifies the password with PBKDF2. Without a bound an
+	// unauthenticated client could pin all CPU cores with a burst of requests
+	// and flood the log with failures, so Basic uses the same KDF semaphore as
+	// the login form.
+	if !m.acquireLoginSlot() {
+		rw.Header().Set("Retry-After", "1")
+		m.writeError(rw, http.StatusTooManyRequests, http.StatusText(http.StatusTooManyRequests))
+		return
+	}
+	defer m.releaseLoginSlot()
+
 	user, ok := m.cfg.users.authenticate(username, password)
 	if !ok {
 		m.logf("basic auth failed for client %s", m.clientLabel(ip))
@@ -893,7 +957,9 @@ func (m *middleware) handleBasicProtected(rw http.ResponseWriter, req *http.Requ
 }
 
 // handlePasswordProtected validates a Bearer session token, a session cookie,
-// or an IP grant, in that order.
+// or an IP grant, in that order. Sessions are only accepted when grantMode is
+// "session" or "both"; with grantMode "ip" a token from an earlier
+// configuration must not keep working.
 func (m *middleware) handlePasswordProtected(rw http.ResponseWriter, req *http.Request) {
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
@@ -908,47 +974,49 @@ func (m *middleware) handlePasswordProtected(rw http.ResponseWriter, req *http.R
 		return
 	}
 
-	// An explicit Authorization header is authoritative: if it is present but
-	// invalid we do not silently fall back to a cookie/IP grant.
-	if hasAuthorization(req) {
-		token, ok := bearerToken(req)
-		if !ok {
-			m.writeUnauthorized(rw, "bearer")
-			return
-		}
-		user, ok, err := m.lookupSession(token)
-		if err != nil {
-			m.logf("redis unavailable for session of client %s: %v", m.clientLabel(ip), err)
-			// Session cookies/tokens are unusable while Redis is down, even when
-			// failClosed is false: otherwise a password session would silently
-			// turn into a fail-open bypass.
-			m.writeError(rw, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
-			return
-		}
-		if !ok {
-			m.writeUnauthorized(rw, "bearer")
-			return
-		}
-		m.serveNext(rw, req, user.username)
-		return
-	}
-
-	if token, ok := m.sessionCookie(req); ok {
-		user, valid, err := m.lookupSession(token)
-		if err != nil {
-			m.logf("redis unavailable for session of client %s: %v", m.clientLabel(ip), err)
-			m.writeError(rw, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
-			return
-		}
-		if valid {
+	if m.cfg.sessionGrantsEnabled() {
+		// An explicit Authorization header is authoritative: if it is present
+		// but invalid we do not silently fall back to a cookie/IP grant.
+		if hasAuthorization(req) {
+			token, ok := bearerToken(req)
+			if !ok {
+				m.writeUnauthorized(rw, "bearer")
+				return
+			}
+			user, ok, err := m.lookupSession(token)
+			if err != nil {
+				m.logf("redis unavailable for session of client %s: %v", m.clientLabel(ip), err)
+				// Session cookies/tokens are unusable while Redis is down, even
+				// when failClosed is false: otherwise a password session would
+				// silently turn into a fail-open bypass.
+				m.writeError(rw, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
+				return
+			}
+			if !ok {
+				m.writeUnauthorized(rw, "bearer")
+				return
+			}
 			m.serveNext(rw, req, user.username)
 			return
 		}
-		m.clearSessionCookie(rw)
+
+		if token, ok := m.sessionCookie(req); ok {
+			user, valid, err := m.lookupSession(token)
+			if err != nil {
+				m.logf("redis unavailable for session of client %s: %v", m.clientLabel(ip), err)
+				m.writeError(rw, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
+				return
+			}
+			if valid {
+				m.serveNext(rw, req, user.username)
+				return
+			}
+			m.clearSessionCookie(rw)
+		}
 	}
 
 	if m.cfg.grantMode == GrantModeIP || m.cfg.grantMode == GrantModeBoth {
-		allowed, err := m.redis.exists(ipGrantKey(m.cfg.keyPrefix, m.cfg.realm, ip))
+		allowed, err := m.ipGrantAllowed(ip)
 		if err != nil {
 			m.logf("redis unavailable for client %s: %v", m.clientLabel(ip), err)
 			m.writeRedisFailure(rw, req)
@@ -966,17 +1034,19 @@ func (m *middleware) handlePasswordProtected(rw http.ResponseWriter, req *http.R
 
 func (m *middleware) handleLogin(rw http.ResponseWriter, req *http.Request) {
 	if req.Method == http.MethodGet || req.Method == http.MethodHead {
-		if token, ok := m.sessionCookie(req); ok {
-			_, valid, err := m.lookupSession(token)
-			if err != nil {
-				m.writeError(rw, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
-				return
+		if m.cfg.sessionGrantsEnabled() {
+			if token, ok := m.sessionCookie(req); ok {
+				_, valid, err := m.lookupSession(token)
+				if err != nil {
+					m.writeError(rw, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
+					return
+				}
+				if valid {
+					m.redirectAfterAuth(rw)
+					return
+				}
+				m.clearSessionCookie(rw)
 			}
-			if valid {
-				m.redirectAfterAuth(rw)
-				return
-			}
-			m.clearSessionCookie(rw)
 		}
 		m.renderLoginPage(rw, http.StatusOK, "")
 		return
@@ -999,6 +1069,15 @@ type loginResponse struct {
 }
 
 func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) {
+	// Browsers send Origin (and Sec-Fetch-Site) on cross-origin POSTs. Reject
+	// those before touching any state: SameSite cookies do not prevent a
+	// cross-site form from logging a victim into an attacker's account.
+	if !sameOriginPost(req) {
+		m.logf("login/logout rejected: cross-origin request")
+		m.writeLoginError(rw, req, http.StatusForbidden, http.StatusText(http.StatusForbidden))
+		return
+	}
+
 	req.Body = http.MaxBytesReader(rw, req.Body, maxLoginBodyBytes)
 	if err := req.ParseForm(); err != nil {
 		m.writeLoginError(rw, req, http.StatusBadRequest, "invalid form")
@@ -1017,7 +1096,16 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	allowed, err := m.loginAllowed(ip)
+	// Bound concurrent KDF work before reserving an attempt, so a burst that is
+	// rejected for concurrency does not consume the client's login budget.
+	if !m.acquireLoginSlot() {
+		rw.Header().Set("Retry-After", "1")
+		m.writeLoginError(rw, req, http.StatusTooManyRequests, http.StatusText(http.StatusTooManyRequests))
+		return
+	}
+	defer m.releaseLoginSlot()
+
+	allowed, err := m.reserveLoginAttempt(ip)
 	if err != nil {
 		m.logf("redis unavailable during login for client %s: %v", m.clientLabel(ip), err)
 		m.writeLoginError(rw, req, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
@@ -1029,22 +1117,13 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	if !m.acquireLoginSlot() {
-		rw.Header().Set("Retry-After", "1")
-		m.writeLoginError(rw, req, http.StatusTooManyRequests, http.StatusText(http.StatusTooManyRequests))
-		return
-	}
-	defer m.releaseLoginSlot()
-
 	// Only accept credentials from the POST body, never from the query string:
 	// a password in the URL would leak into access logs and Referer headers.
 	username := strings.TrimSpace(req.PostFormValue("username"))
 	password := req.PostFormValue("password")
 	user, ok := m.cfg.users.authenticate(username, password)
 	if !ok {
-		if err := m.recordLoginFailure(ip); err != nil {
-			m.logf("cannot record failed login for client %s: %v", m.clientLabel(ip), err)
-		}
+		// The failed attempt was already counted by reserveLoginAttempt.
 		m.logf("login failed for client %s", m.clientLabel(ip))
 		if wantsJSON(req) {
 			m.writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
@@ -1059,7 +1138,10 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 	}
 	m.logf("login succeeded for client %s", m.clientLabel(ip))
 
-	sessionNeeded := m.cfg.grantMode == GrantModeSession || m.cfg.grantMode == GrantModeBoth || wantsJSON(req)
+	// Sessions are only issued and accepted for grantMode session/both. In ip
+	// mode a JSON login deliberately returns no token: an IP grant is the only
+	// credential, and a token issued here would outlive a switch to ip mode.
+	sessionNeeded := m.cfg.sessionGrantsEnabled()
 	token := ""
 	if sessionNeeded {
 		var err error
@@ -1069,13 +1151,10 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 			m.writeLoginError(rw, req, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
 			return
 		}
-		if m.cfg.grantMode == GrantModeSession || m.cfg.grantMode == GrantModeBoth {
-			m.setSessionCookie(rw, token)
-		}
 	}
 
 	if m.cfg.grantMode == GrantModeIP || m.cfg.grantMode == GrantModeBoth {
-		if err := m.redis.setEx(ipGrantKey(m.cfg.keyPrefix, m.cfg.realm, ip), knockValue, m.cfg.ttl); err != nil {
+		if err := m.redis.setEx(ipGrantKey(m.cfg.keyPrefix, m.cfg.realm, ip), sessionValue(user), m.cfg.ttl); err != nil {
 			m.logf("redis unavailable during login for client %s: %v", m.clientLabel(ip), err)
 			if token != "" {
 				if sessionID, ok := parseSessionToken(m.cfg.cookieSecret, m.cfg.realm, token); ok {
@@ -1085,6 +1164,12 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 			m.writeLoginError(rw, req, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
 			return
 		}
+	}
+
+	// Set the cookie only after every grant has been persisted, so a failed IP
+	// grant cannot leave a valid session cookie in a 503 response.
+	if sessionNeeded && token != "" {
+		m.setSessionCookie(rw, token)
 	}
 
 	setNoStore(rw.Header())
@@ -1130,13 +1215,16 @@ func (m *middleware) handleLogout(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	m.clearSessionCookie(rw)
 	if deleteErr != nil {
 		m.logf("logout could not revoke state for client %s: %v", m.clientLabel(ip), deleteErr)
+		// Keep the cookie: the server-side session is still valid, so clearing
+		// it locally would only make a retry impossible while leaving a stolen
+		// token usable until TTL.
 		m.writeLoginError(rw, req, http.StatusServiceUnavailable, http.StatusText(http.StatusServiceUnavailable))
 		return
 	}
 
+	m.clearSessionCookie(rw)
 	m.logf("logout succeeded for client %s", m.clientLabel(ip))
 	if wantsJSON(req) {
 		m.writeJSON(rw, http.StatusOK, map[string]bool{"ok": true})
@@ -1154,6 +1242,44 @@ func (m *middleware) createSession(user *userCredential) (string, error) {
 		return "", err
 	}
 	return signSessionToken(m.cfg.cookieSecret, m.cfg.realm, sessionID), nil
+}
+
+// ipGrantAllowed reports whether the client IP has a live grant. Path-mode
+// grants must contain the legacy "1" marker; a value written by password mode
+// (or anything else) cannot authorize them. Password-mode grants store the
+// credential fingerprint, so changing a password or removing a user also
+// revokes the IP grant.
+func (m *middleware) ipGrantAllowed(ip string) (bool, error) {
+	key := ipGrantKey(m.cfg.keyPrefix, m.cfg.realm, ip)
+	value, ok, err := m.redis.getValue(key)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return false, nil
+	}
+
+	if m.cfg.authMode != AuthModePassword {
+		if value != knockValue {
+			_ = m.redis.del(key)
+			return false, nil
+		}
+		return true, nil
+	}
+
+	username, fingerprint, ok := parseSessionValue(value)
+	if !ok {
+		// A path-mode ("1") or otherwise malformed value cannot authorize a
+		// password-mode request; drop it so it cannot linger until TTL.
+		_ = m.redis.del(key)
+		return false, nil
+	}
+	if _, valid := m.cfg.users.findByFingerprint(username, fingerprint); !valid {
+		// The password changed or the user was removed.
+		_ = m.redis.del(key)
+		return false, nil
+	}
+	return true, nil
 }
 
 func (m *middleware) lookupSession(token string) (*userCredential, bool, error) {
@@ -1244,7 +1370,15 @@ func (m *middleware) writeError(rw http.ResponseWriter, status int, message stri
 func (m *middleware) serveNext(rw http.ResponseWriter, req *http.Request, username string) {
 	m.applyForwardUser(req, username)
 	if m.cfg.privateResponses {
-		rw = newPrivateResponseWriter(rw)
+		// Set the headers before the backend runs as well, so a backend that
+		// returns without writing still cannot leave an implicit 200 cacheable.
+		// The wrapper re-applies them at WriteHeader time in case the backend
+		// overwrites or weakens them.
+		applyPrivateHeaders(rw.Header())
+		private := newPrivateResponseWriter(rw)
+		m.next.ServeHTTP(private, req)
+		private.finish()
+		return
 	}
 	m.next.ServeHTTP(rw, req)
 }

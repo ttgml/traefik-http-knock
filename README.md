@@ -8,8 +8,11 @@ It supports three authentication modes:
 * **path** (the original mode): `GET /__knock__/<secret>` is the credential.
 * **password**: a login form verifies one or more usernames/passwords and issues
   a Redis-backed session cookie; CLI/API clients can use HTTP Basic
-  (`authMode: basic`) or exchange credentials for a Bearer session token.
+  (`authMode: basic`) or, with `grantMode: session`/`both`, exchange credentials
+  for a Bearer session token.
 * **basic**: HTTP Basic authentication on every request, without Redis state.
+  Every request performs a PBKDF2 verification, so this mode is CPU-bound and has
+  no login rate limit; use a Traefik `rateLimit` in front of it.
 
 A successful password login can grant access in three ways:
 
@@ -18,23 +21,27 @@ A successful password login can grant access in three ways:
 * `grantMode: ip`: the original per-IP Redis allowlist.
 * `grantMode: both`: either grant allows the request.
 
-Every grant is scoped to a **realm** (default: the Traefik middleware name), so
-two middlewares sharing a Redis database cannot accidentally grant access to
-each other. Password sessions are always validated against Redis: when Redis is
-unavailable, a password cookie/token is unusable, even with
-`failClosed: false`.
+Every grant is scoped to a **realm**. The default realm is the middleware name
+plus a short digest of the auth endpoints, so two same-named configurations with
+different endpoints do not share grants. Deployments that intentionally share a
+Redis database and `keyPrefix` (for example staging and production, or several
+clusters) must still set a unique `realm` explicitly. Password sessions are
+always validated against Redis: when Redis is unavailable, a password
+cookie/token is unusable, even with `failClosed: false`.
 
 - Traefik v3 middleware plugin (`CreateConfig`, `New`, `ServeHTTP`)
 - Go standard library only, no third-party dependencies (Yaegi friendly)
-- Minimal RESP client: `AUTH`, `SELECT`, `PING`, `EXISTS`, `GET`, `SET ... EX`,
-  `INCR`, `EXPIRE`, `DEL`
+- Minimal RESP client: `AUTH`, `SELECT`, `PING`, `EXISTS`, `GET`,
+  `SET ... EX`, `SET ... EX NX`, `INCR`, `EXPIRE`, `DEL`
 - Bounded Redis connection pool with dial/read/write timeouts
 - Fail closed by default: a Redis outage returns `503`, never `allow`
 - Multiple password users, PBKDF2-HMAC-SHA256 hashes, credentials file/env
 - Redis-backed sessions with logout and password-change revocation
 - HTTP Basic and Bearer session tokens for CLI/API clients
-- Per-IP login rate limiting and bounded concurrent password verification
-- Realm-scoped Redis keys and cookies
+- Per-IP login attempt limiting and bounded concurrent password verification
+  (login form and Basic auth)
+- Realm-scoped Redis keys and cookies; password-mode IP grants are tied to the
+  credential fingerprint
 - CDN-safe protected responses (`Cache-Control: private`, `Vary`)
 
 Path mode was verified end to end against Traefik v3.2.5 (local plugin, Yaegi)
@@ -44,15 +51,14 @@ successful knock (`303 See Other` when `redirectURL` is set), `200` afterwards,
 was unreachable.
 
 Password mode was also verified end to end against Traefik v3.2.5 + Redis 7.4:
-`403` before login, `303` + session cookie on login, `200` on the protected
-route, `303` on logout, and `403` afterwards; the JSON login returned a Bearer
-token that produced `200`, and protected responses carried
-`Cache-Control: private` / `Vary: Cookie, Authorization`. PBKDF2/HMAC/session
-behavior was additionally exercised directly under Yaegi v0.16.1.
+`403` before login, `204` + session cookie on login by default (`303` when
+`redirectURL` is set), `200` on the protected route, `303` on logout, and `403`
+afterwards; the JSON login returned a Bearer token that produced `200`, and
+protected responses carried `Cache-Control: private` /
+`Vary: Cookie, Authorization`. PBKDF2/HMAC/session behavior was additionally
+exercised directly under Yaegi v0.16.1.
 
 Path mode (the default):
-
-```text
 
 ```text
                    Internet
@@ -69,7 +75,7 @@ Path mode (the default):
    GET /__knock__/secret        protected request
           |                          |
           v                          v
-      verify knock              Redis EXISTS
+      verify knock              Redis GET grant
           |                          |
           v                    +-----+-----+
       Redis SETEX              |           |
@@ -113,9 +119,11 @@ push somewhere else.)
 | Multiple users/passwords, PBKDF2 hashes | implemented |
 | Credentials file/environment, cookie-secret file/environment | implemented |
 | HTTP Basic auth (`authMode: basic`) | implemented |
-| Bearer session token for CLI/API (`Accept: application/json`) | implemented |
+| Bearer session token for CLI/API (`Accept: application/json`, `grantMode: session`/`both`) | implemented |
 | Logout (`POST` + `action=logout`) and password-change revocation | implemented |
-| Login rate limiting per IP and bounded concurrent KDFs | implemented |
+| Login attempt limiting per IP and bounded concurrent KDFs (form and Basic) | implemented |
+| Login/logout CSRF protection (same-origin header check) | implemented |
+| Password-mode IP grants tied to the credential fingerprint | implemented |
 | Redis session store with TTL and hashed session keys | implemented |
 | Realm-scoped Redis keys and signed tokens | implemented |
 | CDN-safe `Cache-Control: private` / `Vary` on protected responses | implemented |
@@ -162,26 +170,39 @@ combined in the same instance.
    * `session` (default): a Redis-backed session cookie is set. The same
      session token can be used as `Authorization: Bearer <token>` for API
      clients.
-   * `ip`: the client IP is stored in Redis, as in path mode.
+   * `ip`: the client IP is stored in Redis, as in path mode. No session or
+     Bearer token is issued or accepted in this mode.
    * `both`: both grants are issued; either one allows the request.
 4. `POST <loginPath>` with `action=logout` deletes the Redis session and the IP
-   grant (when applicable), and clears the cookie.
+   grant (when applicable), and clears the cookie after the revocation succeeds.
 5. JSON clients can send `Accept: application/json` (or `?format=token`) to
-   receive:
+   receive a token when `grantMode` is `session` or `both`:
 
 ```json
 {"ok":true,"username":"alice","token":"v1....","expiresIn":43200}
 ```
 
+   With `grantMode: ip` the response contains `ok`/`username` but no token.
 6. Changing a user's password changes the credential fingerprint stored in the
-   session value. Existing sessions for that user are then rejected and
-   deleted on their next use.
+   session value and in password-mode IP grants. Existing sessions and IP grants
+   for that user are then rejected and deleted on their next use.
+
+Login and logout POSTs from a browser must be same-origin. The middleware checks
+`Sec-Fetch-Site`, `Origin` and `Referer` (in that order) and rejects cross-origin
+submissions with `403`; non-browser clients that send none of these headers are
+allowed. This is the CSRF defense for both login and logout. If a TLS-terminating
+proxy sits in front of Traefik, make sure it sets `X-Forwarded-Proto` so the
+same-origin comparison sees the `https` scheme.
 
 **`basic`**
 
 HTTP Basic credentials are verified on every request. This mode is stateless
 and does not use Redis for access decisions. It is intended for CLI/API clients;
-browsers will show a native credential dialog and have no logout button.
+browsers will show a native credential dialog and have no logout button. Every
+request runs a PBKDF2 verification (the default hash costs tens of milliseconds),
+so Basic is CPU-bound; `maxConcurrentLogins` bounds concurrent verifications, but
+there is no per-IP rate limit. Compose a Traefik `rateLimit` middleware and use
+Basic only where that cost is acceptable.
 
 ### 2.2 Protected request flow
 
@@ -189,12 +210,15 @@ browsers will show a native credential dialog and have no logout button.
 2. If the IP is on `staticAllowlist`, forward the request immediately. Static
    entries do not need Redis, so they keep working during a Redis outage.
 3. Otherwise, depending on the mode:
-   * **path**: check `EXISTS <prefix><realm>:ip:<clientIP>`.
-   * **password**: check a Bearer token, then the session cookie, then
-     (for `grantMode: ip`/`both`) the IP key.
+   * **path**: check that `<prefix><realm>:ip:<clientIP>` contains the legacy
+     `1` marker.
+   * **password**: with `grantMode: session`/`both`, check a Bearer token, then
+     the session cookie; then, for `grantMode: ip`/`both`, check the IP key.
+     With `grantMode: ip`, session cookies/tokens are ignored.
    * **basic**: verify the `Authorization: Basic` header.
 4. On success call `next.ServeHTTP()`. Otherwise return `401` (Basic/Bearer
-   challenge), `403` (no grant), or `429` (login rate limit).
+   challenge), `403` (no grant), or `429` (login/attempt or KDF-concurrency
+   limit).
 
 Session lookups always fail closed: if Redis is unavailable, a password session
 cookie/token is unusable even when `failClosed: false`. This prevents a Redis
@@ -202,27 +226,33 @@ outage from silently turning a password session into a fail-open bypass.
 
 By default, protected responses in password/basic mode are marked
 `Cache-Control: private` and `Vary: Cookie, Authorization`, so a CDN cannot
-cache an authenticated response and serve it to another client. Set
-`privateResponses: false` only if you have another cache-isolation mechanism.
+cache an authenticated response and serve it to another client. A backend's
+stronger `Cache-Control: no-store` is preserved. Set `privateResponses: false`
+only if you have another cache-isolation mechanism.
 
-The plugin never forwards an authentication endpoint request to the backend.
-Password fields, session cookies and bearer tokens are not written to logs.
+The plugin never forwards a login request or a path-mode `GET` knock to the
+backend. A non-GET request to the path-mode knock URL is deliberately treated as
+an ordinary protected request (so it is indistinguishable from any other path)
+and may reach the backend once the client is authorized. Password fields, session
+cookies and bearer tokens are not written to logs.
 
 ## 3. Redis data model
 
-All keys are realm-scoped. `realm` defaults to the Traefik middleware name.
+All keys are realm-scoped. `realm` defaults to the middleware name plus a short
+digest of the auth endpoints; set it explicitly when several deployments share
+the same Redis database.
 
 | Key | Value | TTL |
 | --- | --- | --- |
-| `<keyPrefix><realm>:ip:<clientIP>` | `1` | `ttl` |
+| `<keyPrefix><realm>:ip:<clientIP>` | path mode: `1`; password mode: `<username>|<credential-fingerprint>` | `ttl` |
 | `<keyPrefix><realm>:session:<sha256(sessionID)>` | `<username>|<credential-fingerprint>` | `sessionTTL` |
-| `<keyPrefix><realm>:login:<clientIP>` | failed-attempt counter | `loginWindow` |
+| `<keyPrefix><realm>:login:<clientIP>` | login-attempt counter | `loginWindow` |
 
 Examples:
 
 ```text
-traefik:http-knock:app-a:ip:192.168.1.10       -> 1
-traefik:http-knock:app-a:ip:2001:db8::1        -> 1
+traefik:http-knock:app-a:ip:192.168.1.10       -> 1 (path mode)
+traefik:http-knock:app-a:ip:2001:db8::1        -> alice|8f2a... (password mode)
 traefik:http-knock:app-a:session:59c4...       -> alice|8f2a...
 traefik:http-knock:app-a:login:203.0.113.5     -> 2
 ```
@@ -230,12 +260,15 @@ traefik:http-knock:app-a:login:203.0.113.5     -> 2
 * The IP is normalized (`net.ParseIP(...).String()`) before the key is built, so
   different spellings of the same IPv6 address cannot create two entries.
 * The raw session id is never stored in Redis; only its SHA-256 is used as key
-  material. A Redis dump cannot be replayed as a valid cookie/token.
-* The session value contains the username and a fingerprint of the current
-  password hash. Changing the password or removing the user invalidates the
-  session on its next use.
-* Login counters are incremented with `INCR`; `INCR` is never retried
-  automatically because it is not idempotent.
+  material. A Redis dump cannot be replayed as a valid cookie/token. Path-mode
+  IP grants must contain exactly the legacy `1` marker, so a value written by
+  password mode (or another application) cannot authorize path mode.
+* Session and password-mode IP values contain the username and a fingerprint of
+  the current credential. Changing the password or removing the user invalidates
+  both on their next use. A path-mode IP value is the legacy `1`.
+* Login counters are created with `SET ... EX NX`, incremented with `INCR`, and
+  always receive an `EXPIRE`; a successful login deletes the counter. `INCR`
+  itself is never retried automatically because it is not idempotent.
 
 Inspect state manually:
 
@@ -255,21 +288,22 @@ in. Use per-user passwords and rotate them when someone leaves.
 | Risk | Mitigation |
 | --- | --- |
 | Guessable path secret | Use a 128-bit random secret (`openssl rand -hex 32`); length is enforced at config time (6–80 chars) |
-| Timing side channel on secrets/passwords | Constant-time path, password and hash comparisons |
-| Weak password brute force | PBKDF2-HMAC-SHA256 hashes, per-IP login rate limiting, bounded concurrent KDFs, optional Traefik `rateLimit` |
+| Timing side channel on secrets/passwords | Constant-time path, password and hash comparisons; unknown usernames run a dummy PBKDF2 derivation |
+| Weak password brute force | PBKDF2-HMAC-SHA256 hashes, per-IP login attempt limiting, bounded concurrent KDFs. Basic auth has no rate limit; compose a Traefik `rateLimit` |
+| Login/logout CSRF | Login and logout POSTs require a same-origin `Sec-Fetch-Site`/`Origin`/`Referer`; cross-origin submissions get `403` |
 | Password leak in config/dashboard | Prefer `passwordHash` or a `credentialsFile` mounted from a Secret; `password` plaintext is for development only |
 | Password in URLs/logs | Login uses POST bodies, never query strings; authentication endpoints are never forwarded to the backend |
 | Session theft | 256-bit random ids, HMAC-signed cookie/token, `HttpOnly`, `Secure`, `SameSite=Lax`, `__Host-` cookie by default |
 | Session fixation | A new session id is generated on every login |
-| Logout/revocation | Redis `DEL` on logout; password change invalidates sessions via the credential fingerprint |
+| Logout/revocation | Redis `DEL` on logout; password change or user removal invalidates sessions and password-mode IP grants via the credential fingerprint |
 | Redis outage turning into an allow | Session lookups always return `503`; IP allowlist follows `failClosed` |
-| Cookie/token replay across apps | HMAC and Redis keys include the realm; cookies include a realm-derived name |
+| Cookie/token replay across apps | HMAC and Redis keys include the realm; cookies include a realm-derived name. Set a unique realm when deployments share Redis |
 | CDN caching authenticated content | `Cache-Control: private` + `Vary: Cookie, Authorization` on protected responses by default |
-| Open redirect via `redirectURL` | Only same-origin paths and absolute `http`/`https` URLs; `//host`, other schemes, control characters and backslashes are rejected |
+| Open redirect via `redirectURL`/`loginPath` | Only same-origin paths and absolute `http`/`https` URLs; `//host`, backslashes, percent-encoding, control characters and (for login/knock paths) whitespace are rejected |
 | Header spoofing (`X-Forwarded-For` etc.) | Off by default. `clientIPHeader` must only be set behind a trusted proxy that overwrites it |
 | Static allowlist matching a spoofed IP | Static entries use the same resolved IP; keep `clientIPHeader` empty unless the proxy is trusted |
 | Secret leaking into startup logs | `knockPath`/`loginPath` validation errors do not echo the configured value |
-| Log flooding from denials | Login failures are rate-limited; use `logClientIP` only if you accept logging client IPs |
+| Log flooding from denials | Login attempts are limited; Basic verification is concurrency-bounded, but Basic failures are logged per request. Use `logClientIP` only if you accept logging client IPs |
 | Redis compromise | Password, NetworkPolicy, and ideally TLS for cross-network Redis |
 
 Residual risks:
@@ -278,12 +312,19 @@ Residual risks:
   person if you need attribution or per-person revocation.
 * Password sessions are valid for the whole `sessionTTL`. Use a short TTL for
   sensitive services and rotate `cookieSecret` to invalidate every session.
-* Basic auth sends the password on every request and has no logout; use it only
-  over TLS and preferably for API/CLI clients.
+* Basic auth sends the password on every request and has no logout; every request
+  costs a PBKDF2 verification, and there is no per-IP rate limit. Use it only
+  over TLS, preferably for API/CLI clients, and compose a Traefik `rateLimit`.
 * A stolen session token remains usable until logout, password change, or TTL
   expiry.
 * Behind carrier-grade NAT, `grantMode: ip` shares access with other users of
-  the same public IP. `grantMode: session` avoids that.
+  the same public IP. `grantMode: session` avoids that. The password-mode IP
+  value holds the last login's credential fingerprint, so if that user's
+  password changes the whole shared IP loses access until someone logs in again.
+* The CSRF check relies on browser headers. A client that sends no
+  `Sec-Fetch-Site`, `Origin` or `Referer` is treated as non-browser and allowed;
+  use a signed CSRF token in front of the login endpoint if that residual risk is
+  not acceptable.
 
 ## 5. Configuration reference
 
@@ -292,7 +333,8 @@ Residual risks:
 ```yaml
 httpKnock:
   # Required. Exact path that triggers the knock. Must start with "/",
-  # must not contain "?" or "#", 6 to 80 characters long.
+  # must not be protocol-relative or contain "?", "#", backslashes,
+  # percent-encoding, whitespace or control characters; 6 to 80 chars.
   knockPath: "/__knock__/9c4e2e4e3b6d0c0f7b1a2c3d4e5f60718293a4b5c6d7e8f9"
   # Allowlist entry lifetime (Go duration). Redis expires the key.
   ttl: "2h"
@@ -305,7 +347,7 @@ httpKnock:
   redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
   redisUsername: ""
   redisPassword: ""
-  redisDB: 0
+  redisDB: 0                    # Redis enables 0-15 by default
 
   keyPrefix: "traefik:http-knock:"
   clientIPHeader: ""
@@ -353,6 +395,8 @@ httpKnock:
   # credentialsEnv: "HTTP_KNOCK_CREDENTIALS"
 
   # ip | session | both. Defaults to session for password mode.
+  # With ip, no session/Bearer token is issued or accepted (JSON login returns
+  # no token); with both, either grant allows the request.
   grantMode: session
   sessionTTL: "12h"
 
@@ -364,11 +408,13 @@ httpKnock:
   cookieSecure: true
   cookieSameSite: "Lax"     # Lax | Strict | None
 
-  # Realm defaults to the Traefik middleware name. Set it explicitly when you
-  # want stable keys across middleware renames.
+  # Realm defaults to the middleware name plus a short digest of the auth
+  # endpoints. Set it explicitly to keep keys stable across config changes and
+  # whenever several deployments share this Redis database/keyPrefix.
   realm: ""
 
-  # Login protection. 0 disables the individual limit.
+  # Login protection. Every attempt counts; success clears the counter.
+  # 0 disables the individual limit. maxConcurrentLogins also bounds Basic auth.
   maxLoginAttempts: 5
   loginWindow: "15m"
   maxConcurrentLogins: 4
@@ -404,22 +450,37 @@ httpKnock:
   logClientIP: false
 ```
 
-Basic mode is stateless and does not need Redis. Login rate limiting is not
-applied to Basic requests; compose a Traefik `rateLimit` middleware if the
-endpoint is exposed to untrusted networks.
+Basic mode is stateless and does not need Redis. Every request performs a
+PBKDF2 verification, and `maxConcurrentLogins` bounds concurrent verifications,
+but login rate limiting is not applied to Basic requests. Compose a Traefik
+`rateLimit` middleware if the endpoint is exposed to untrusted networks, and keep
+the request rate in mind: a default 120000-iteration hash costs tens of
+milliseconds per request.
 
 ### 5.4 Notes
 
 * Upgrading from v0.1.x: Redis keys are now realm-scoped, for example
   `traefik:http-knock:<realm>:ip:<clientIP>` instead of
-  `traefik:http-knock:<clientIP>`. Old IP grants are ignored after the upgrade;
-  clients simply knock/log in again. Set `realm` explicitly if the Middleware
-  name may change.
+  `traefik:http-knock:<clientIP>`. The default realm is derived from the
+  middleware name plus a digest of the auth endpoints, so old grants are ignored
+  after the upgrade; clients simply knock/log in again. Set `realm` explicitly
+  if the Middleware name or endpoints may change, or if several deployments
+  share the same Redis database.
+* Password-mode IP grants store the credential fingerprint, so changing a
+  password or removing a user also revokes IP access (not only sessions).
+* Login and logout POSTs are rejected with `403` when the browser says the
+  request is cross-origin (`Sec-Fetch-Site`/`Origin`/`Referer`). API clients
+  that send none of these headers are allowed.
+* `loginPath` is only routed in password mode; setting it in path/basic mode has
+  no effect. It must be a plain absolute path (no `//host`, backslashes, `%`
+  escapes, whitespace or control characters).
+* `cookieSecretFile` takes precedence over `cookieSecretEnv` and `cookieSecret`;
+  an empty or unset env var does not mask a valid file.
 * Invalid values make Traefik reject the middleware at load time with a
   descriptive error; no request is served with a half-applied configuration.
 * `failClosed` uses a `*bool` so that "unset" means `true`.
 * Password sessions always fail closed when Redis is unavailable, regardless of
-  `failClosed`. Password mode also needs Redis for the login rate limiter and
+  `failClosed`. Password mode also needs Redis for the login attempt limiter and
   the session/IP grant, so `failClosed: false` does not make login work during a
   Redis outage.
 * Redis is not contacted when the middleware is created, so a Redis outage
@@ -529,13 +590,15 @@ traefik-http-knock/
 ├── knock.go                      # Config, CreateConfig, New, ServeHTTP
 ├── auth.go                       # users, login form, cookies, sessions
 ├── crypto.go                     # PBKDF2, HMAC, token signing, constant time
-├── ratelimit.go                  # per-IP login failure counters
+├── ratelimit.go                  # per-IP login attempt reservation
 ├── response.go                   # CDN-safe response writer
 ├── ip.go                         # client IP extraction, normalization, keys
 ├── redis.go                      # minimal RESP client + bounded pool
 ├── cmd/knockhash/main.go         # password-hash generator
 ├── knock_test.go                 # middleware behaviour tests
 ├── auth_test.go                  # password, session, Basic and realm tests
+├── auth_hardening_test.go        # CSRF, IP-grant and config hardening tests
+├── response_test.go              # private response writer tests
 ├── crypto_test.go                # hash/token tests
 ├── ip_test.go                    # IP parsing tests
 ├── redis_test.go                 # RESP client/pool tests + Redis integration test
@@ -826,9 +889,11 @@ Operational notes:
   point `redisAddr` at it. The plugin currently speaks plain RESP over TCP; if
   you need TLS to Redis, terminate it in a sidecar/socat proxy or add
   `crypto/tls` support.
-* IP/session keys are written with `SET ... EX`; login counters receive an
-  `EXPIRE` on the first failure. Redis therefore expires all state even if the
-  plugin disappears mid-flight.
+* IP/session keys are written with `SET ... EX`. Login counters are created with
+  `SET ... EX NX`, incremented, and refreshed with `EXPIRE` on every attempt; a
+  failed `EXPIRE` deletes the counter instead of leaving a TTL-less key. A
+  successful login deletes it. Redis therefore expires all login state even if
+  the plugin disappears mid-flight.
 
 ## 11. Cloudflare / load balancer scenarios
 
@@ -857,7 +922,7 @@ Behind Cloudflare (or any reverse proxy / ingress in front of Traefik):
 | Symptom | Likely cause | Action |
 | --- | --- | --- |
 | Every request `403` after a successful knock | Knock and access use different source IPs (proxy, NAT, IPv6/IPv4 mix) | Use `grantMode: session` for password auth, or log the resolved IP (`logClientIP: true`) and compare with `redis-cli --scan` |
-| Password login returns `429` | `maxLoginAttempts` reached for this IP | Wait for `loginWindow`, or clear `<prefix><realm>:login:<ip>` in Redis |
+| Password login returns `429` | `maxLoginAttempts` reached for this IP, or too many concurrent KDFs | Wait for `loginWindow`/the KDF slot, or clear `<prefix><realm>:login:<ip>` in Redis |
 | Login succeeds but the next request is `403` | Cookie not sent (wrong host/Secure/Path), or the session was revoked | Check the cookie in devtools; confirm `cookieSecure` matches HTTPS; inspect the session key in Redis |
 | Password cookie stops working with `503` | Redis is down; sessions always fail closed | Restore Redis; this is intentional even with `failClosed: false` |
 | Every request `503` | Redis unreachable, wrong `redisAddr`, auth failure, or `SELECT` to a disabled DB | `kubectl -n traefik-http-knock logs deploy/redis`, check the Secret, test with `redis-cli -h ... -a ...` |
@@ -887,8 +952,9 @@ go test -race ./...
 
 The unit tests use an in-process fake Redis server (`testserver_test.go`), so no
 Docker is required. They cover path mode, password login, multiple users,
-sessions, logout/revocation, Basic auth, Bearer tokens, realm isolation, rate
-limiting, CDN headers, PBKDF2/HMAC, and the RESP client.
+sessions, logout/revocation, Basic auth, Bearer tokens, realm isolation, login
+rate limiting and KDF concurrency, CSRF/origin checks, password-change IP-grant
+revocation, CDN headers, PBKDF2/HMAC, and the RESP client.
 
 Generate a password hash for local tests or deployment:
 
@@ -959,11 +1025,13 @@ Verified live against **Traefik v3.2.5 + Redis 7.4** during development:
 | Redis stopped | `503` for both knock and protected requests, no panic |
 | Redis `-NOPERM` on `SET` (server error) | `503`, connection reused, no panic |
 
-Password, session, Basic, Bearer, realm and CDN-header behavior is covered by the
-unit tests (`auth_test.go`, `crypto_test.go`, `redis_test.go`). The password
-login, Redis session cookie, protected request, logout/revocation, JSON Bearer
-flow, PBKDF2 hash verification and Basic auth were also exercised under Yaegi
-v0.16.1 and against Traefik v3.2.5 + Redis 7.4 end to end.
+Password, session, Basic, Bearer, realm, CSRF/origin, IP-grant revocation and
+CDN-header behavior is covered by the unit tests (`auth_test.go`,
+`auth_hardening_test.go`, `crypto_test.go`, `redis_test.go`,
+`response_test.go`). The password login, Redis session cookie, protected
+request, logout/revocation, JSON Bearer flow, PBKDF2 hash verification and Basic
+auth were also exercised under Yaegi v0.16.1 and against Traefik v3.2.5 + Redis
+7.4 end to end.
 
 ## 14. Usage with curl
 
@@ -996,8 +1064,8 @@ HTTP/2 403
 ```
 
 Wrong method (only `GET` knocks; a `POST` — and `curl -I`, which sends `HEAD` —
-is treated as a protected request and answers the same `403` as any other path,
-so it does not confirm the secret):
+is treated as a protected request and answers the same status as any other path
+(`403` until the client is authorized), so it does not confirm the secret):
 
 ```bash
 $ curl -i -X POST https://example.com/__knock__/9c4e...f9
@@ -1056,8 +1124,14 @@ repeated failures get `429` once `maxLoginAttempts` is reached.
       invalidate all sessions.
 * [ ] `privateResponses: true` (default for password/basic) and the CDN is
       configured not to cache protected responses.
-* [ ] Login rate limiting (`maxLoginAttempts`, `loginWindow`) is enabled, and a
-      Traefik `rateLimit` middleware is composed for Basic/API endpoints.
+* [ ] Login attempt limiting (`maxLoginAttempts`, `loginWindow`) and a bounded
+      `maxConcurrentLogins` are enabled. Compose a Traefik `rateLimit`
+      middleware for Basic/API endpoints; Basic itself has no per-IP limit.
+* [ ] `realm` is set explicitly (and unique) if several deployments or
+      same-named middlewares share a Redis database and `keyPrefix`.
+* [ ] Login/logout CSRF is covered by the same-origin header check; if you need
+      protection against clients that omit the headers, put a signed CSRF token
+      or an edge WAF in front of the login endpoint.
 * [ ] The knock URL/login endpoint is shared over a secure channel and rotated
       when leaked.
 * [ ] `ttl` is the shortest acceptable window (minutes for admin panels, hours

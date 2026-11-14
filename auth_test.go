@@ -682,6 +682,7 @@ func TestPasswordConfigValidation(t *testing.T) {
 		{name: "missing redis for password", mutate: func(c *Config) { c.RedisAddr = "" }, wantErr: "redisAddr"},
 		{name: "negative attempts", mutate: func(c *Config) { c.MaxLoginAttempts = -1 }, wantErr: "maxLoginAttempts"},
 		{name: "negative concurrent", mutate: func(c *Config) { c.MaxConcurrentLogins = -1 }, wantErr: "maxConcurrentLogins"},
+		{name: "invalid pool wait", mutate: func(c *Config) { c.PoolWaitTimeout = "not-a-duration" }, wantErr: "poolWaitTimeout"},
 		{name: "forward authorization header", mutate: func(c *Config) { c.ForwardUserHeader = "Authorization" }, wantErr: "must not overwrite Authorization"},
 	}
 
@@ -715,6 +716,7 @@ func TestUnusedSettingsByModeAreNotValidated(t *testing.T) {
 	basic.DialTimeout = "not-a-duration"
 	basic.ReadTimeout = "not-a-duration"
 	basic.WriteTimeout = "not-a-duration"
+	basic.PoolWaitTimeout = "not-a-duration"
 	basic.RedisPoolSize = -2
 	basic.RedisDB = -1
 	basic.KeyPrefix = "bad prefix"
@@ -988,6 +990,12 @@ func TestAuthConfigDefaults(t *testing.T) {
 	if cfg.MaxConcurrentLogins != defaultMaxConcurrent {
 		t.Fatalf("MaxConcurrentLogins = %d, want %d", cfg.MaxConcurrentLogins, defaultMaxConcurrent)
 	}
+	if cfg.PoolWaitTimeout != defaultPoolWaitTimeout.String() {
+		t.Fatalf("PoolWaitTimeout = %q, want %q", cfg.PoolWaitTimeout, defaultPoolWaitTimeout)
+	}
+	if cfg.LogDecisions {
+		t.Fatal("LogDecisions must default to false")
+	}
 
 	s, err := cfg.settings()
 	if err == nil {
@@ -1007,6 +1015,12 @@ func TestAuthConfigDefaults(t *testing.T) {
 	}
 	if !s.privateResponses {
 		t.Fatal("path mode must default privateResponses to true")
+	}
+	if s.poolWaitTimeout != defaultPoolWaitTimeout {
+		t.Fatalf("poolWaitTimeout = %s, want %s", s.poolWaitTimeout, defaultPoolWaitTimeout)
+	}
+	if s.logDecisions {
+		t.Fatal("logDecisions must default to false")
 	}
 
 	// Backends that intentionally allow shared caching can still opt out.

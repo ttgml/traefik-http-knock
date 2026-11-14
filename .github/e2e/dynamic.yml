@@ -38,6 +38,7 @@ http:
           failClosed: true
           privateResponses: true
           logClientIP: true
+          logDecisions: true
 
     http-knock-password:
       plugin:
@@ -48,8 +49,8 @@ http:
           redirectURL: "/"
           grantMode: session
           sessionTTL: "12h"
-          # 120,000 iterations are deliberate here: they keep the smoke test
-          # fast and also exercise hashes created with the old default.
+          # 120,000 iterations match the current default and keep the smoke test
+          # fast.
           users:
             - username: alice
               passwordHash: "pbkdf2-sha256$120000$meLQaHL4/orKwUV0C4hW6w==$YIBFHpNWufILHzdjvLNixS3zbjr5ayZtRQQ2mMiZdWg="
@@ -63,12 +64,14 @@ http:
           maxLoginAttempts: 5
           loginWindow: "15m"
           maxConcurrentLogins: 4
+          poolWaitTimeout: "2s"
           privateResponses: true
           redisAddr: "redis:6379"
           redisPassword: "devpassword"
           keyPrefix: "traefik:http-knock:"
           failClosed: true
           logClientIP: true
+          logDecisions: true
 
     http-knock-basic:
       plugin:
@@ -81,6 +84,7 @@ http:
           privateResponses: true
           maxConcurrentLogins: 4
           logClientIP: true
+          logDecisions: true
 
   services:
     whoami:

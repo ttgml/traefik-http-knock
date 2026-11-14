@@ -54,6 +54,7 @@ spec:
       dialTimeout: "2s"
       readTimeout: "1s"
       writeTimeout: "1s"
+      poolWaitTimeout: "2s"
       redisPoolSize: 16
 
       # Prevent a shared cache/CDN from storing an authorized response.
@@ -61,3 +62,5 @@ spec:
 
       # Client IPs stay out of the logs unless you opt in.
       logClientIP: false
+      # Per-request allow/deny and failed-auth logs are off by default.
+      logDecisions: false

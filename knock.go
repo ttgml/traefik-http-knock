@@ -34,11 +34,12 @@ const (
 	// DefaultTTL is the default lifetime of a successful knock.
 	DefaultTTL = 2 * time.Hour
 
-	defaultRedisDB       = 0
-	defaultDialTimeout   = 2 * time.Second
-	defaultReadTimeout   = time.Second
-	defaultWriteTimeout  = time.Second
-	defaultRedisPoolSize = 16
+	defaultRedisDB         = 0
+	defaultDialTimeout     = 2 * time.Second
+	defaultReadTimeout     = time.Second
+	defaultWriteTimeout    = time.Second
+	defaultRedisPoolSize   = 16
+	defaultPoolWaitTimeout = 2 * time.Second
 
 	// minKnockPathLength and maxKnockPathLength bound the knock path. The real
 	// secret is the path itself, so a short path is only accepted to keep the
@@ -147,12 +148,24 @@ type Config struct {
 	WriteTimeout string `json:"writeTimeout,omitempty"`
 
 	// RedisPoolSize is the maximum number of Redis connections kept by the
-	// plugin. Defaults to 16.
+	// plugin. Defaults to 16. The pool is per middleware instance.
 	RedisPoolSize int `json:"redisPoolSize,omitempty"`
+
+	// PoolWaitTimeout bounds how long a request waits for a free pooled Redis
+	// connection before failing with a pool-exhausted error. Defaults to 2s.
+	PoolWaitTimeout string `json:"poolWaitTimeout,omitempty"`
 
 	// LogClientIP includes the client IP in log lines. Off by default so that
 	// logs do not necessarily contain end-user addresses.
 	LogClientIP bool `json:"logClientIP,omitempty"`
+
+	// LogDecisions logs every per-request allow/deny decision and every failed
+	// authentication attempt. It is off by default because a flood of
+	// unauthenticated requests, failed logins or static-allowlist health checks
+	// can otherwise serialize on the logger and generate significant stderr
+	// I/O. Successful knocks/logins, Redis failures and configuration errors
+	// are logged regardless. Traefik access logs already record every request.
+	LogDecisions bool `json:"logDecisions,omitempty"`
 
 	// AuthMode selects how credentials are verified:
 	//
@@ -283,6 +296,7 @@ func CreateConfig() *Config {
 		ReadTimeout:         defaultReadTimeout.String(),
 		WriteTimeout:        defaultWriteTimeout.String(),
 		RedisPoolSize:       defaultRedisPoolSize,
+		PoolWaitTimeout:     defaultPoolWaitTimeout.String(),
 		RedisDB:             defaultRedisDB,
 		AuthMode:            AuthModePath,
 		CookieSecure:        boolPtr(true),
@@ -297,27 +311,31 @@ func CreateConfig() *Config {
 // settings is the validated, parsed form of Config. The middleware only ever
 // reads this type, which keeps request handling free of string parsing.
 type settings struct {
-	knockPath      string
-	ttl            time.Duration
-	redisAddr      string
-	redisUsername  string
-	redisPassword  string
-	redisDB        int
-	keyPrefix      string
-	clientIPHeader string
-	failClosed     bool
-	dialTimeout    time.Duration
-	readTimeout    time.Duration
-	writeTimeout   time.Duration
-	redisPoolSize  int
-	logClientIP    bool
-	redirectURL    string
-	allowlist      *staticAllowlist
+	knockPath       string
+	ttl             time.Duration
+	redisAddr       string
+	redisUsername   string
+	redisPassword   string
+	redisDB         int
+	keyPrefix       string
+	clientIPHeader  string
+	failClosed      bool
+	dialTimeout     time.Duration
+	readTimeout     time.Duration
+	writeTimeout    time.Duration
+	redisPoolSize   int
+	poolWaitTimeout time.Duration
+	logClientIP     bool
+	logDecisions    bool
+	redirectURL     string
+	allowlist       *staticAllowlist
 
 	authMode            string
 	grantMode           string
 	loginPath           string
 	realm               string
+	basicChallenge      string
+	bearerChallenge     string
 	users               *userSet
 	cookieName          string
 	cookieSecret        []byte
@@ -372,6 +390,7 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 		keyPrefix:      c.KeyPrefix,
 		clientIPHeader: http.CanonicalHeaderKey(strings.TrimSpace(c.ClientIPHeader)),
 		logClientIP:    c.LogClientIP,
+		logDecisions:   c.LogDecisions,
 		authMode:       strings.ToLower(strings.TrimSpace(c.AuthMode)),
 		loginPath:      strings.TrimSpace(c.LoginPath),
 		realm:          strings.TrimSpace(c.Realm),
@@ -441,6 +460,8 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 	if !validRealm(s.realm) {
 		return nil, fmt.Errorf("http-knock: realm %q contains unsupported characters", s.realm)
 	}
+	s.basicChallenge = fmt.Sprintf("Basic realm=%q, charset=\"UTF-8\"", s.realm)
+	s.bearerChallenge = fmt.Sprintf("Bearer realm=%q", s.realm)
 
 	if s.authMode == AuthModePath {
 		if len(c.Users) > 0 || c.CredentialsFile != "" || c.CredentialsEnv != "" {
@@ -498,6 +519,12 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 		}
 		s.writeTimeout = writeTimeout
 
+		poolWaitTimeout, err := parseDuration("poolWaitTimeout", c.PoolWaitTimeout, defaultPoolWaitTimeout)
+		if err != nil {
+			return nil, err
+		}
+		s.poolWaitTimeout = poolWaitTimeout
+
 		poolSize, err := parsePoolSize(c.RedisPoolSize)
 		if err != nil {
 			return nil, err
@@ -511,6 +538,7 @@ func (c *Config) settingsFor(name string) (*settings, error) {
 		s.dialTimeout = defaultDialTimeout
 		s.readTimeout = defaultReadTimeout
 		s.writeTimeout = defaultWriteTimeout
+		s.poolWaitTimeout = defaultPoolWaitTimeout
 		s.redisPoolSize = defaultRedisPoolSize
 	}
 
@@ -852,14 +880,15 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		cfg:      cfg,
 		verifier: pathVerifier{path: cfg.knockPath},
 		redis: newRedisClient(redisOptions{
-			addr:         cfg.redisAddr,
-			username:     cfg.redisUsername,
-			password:     cfg.redisPassword,
-			db:           cfg.redisDB,
-			dialTimeout:  cfg.dialTimeout,
-			readTimeout:  cfg.readTimeout,
-			writeTimeout: cfg.writeTimeout,
-			maxConns:     cfg.redisPoolSize,
+			addr:            cfg.redisAddr,
+			username:        cfg.redisUsername,
+			password:        cfg.redisPassword,
+			db:              cfg.redisDB,
+			dialTimeout:     cfg.dialTimeout,
+			readTimeout:     cfg.readTimeout,
+			writeTimeout:    cfg.writeTimeout,
+			poolWaitTimeout: cfg.poolWaitTimeout,
+			maxConns:        cfg.redisPoolSize,
 		}),
 		logger: log.New(os.Stderr, fmt.Sprintf("[http-knock] %s: ", name), log.LstdFlags),
 	}
@@ -903,13 +932,13 @@ func (m *middleware) handlePathKnock(rw http.ResponseWriter, req *http.Request) 
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
 		// Deliberately 403 and not 400: do not confirm that the path matched.
-		m.logf("knock rejected: %v", err)
+		m.logDecisionf("knock rejected: %v", err)
 		m.writeError(rw, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
 
 	if !m.verifier.Authorize(req, ip) {
-		m.logf("knock rejected: invalid token for client %s", m.clientLabel(ip))
+		m.logDecisionf("knock rejected: invalid token for client %s", m.clientLabel(ip))
 		m.writeError(rw, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
@@ -937,13 +966,13 @@ func (m *middleware) handlePathKnock(rw http.ResponseWriter, req *http.Request) 
 func (m *middleware) handlePathProtected(rw http.ResponseWriter, req *http.Request) {
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
-		m.logf("request denied: %v", err)
+		m.logDecisionf("request denied: %v", err)
 		m.writeError(rw, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
 
 	if m.cfg.allowlist.contains(ip) {
-		m.logf("request allowed for client %s: static allowlist", m.clientLabel(ip))
+		m.logDecisionf("request allowed for client %s: static allowlist", m.clientLabel(ip))
 		m.serveNext(rw, req, "")
 		return
 	}
@@ -955,7 +984,7 @@ func (m *middleware) handlePathProtected(rw http.ResponseWriter, req *http.Reque
 		return
 	}
 	if !allowed {
-		m.logf("request denied for client %s: no active knock", m.clientLabel(ip))
+		m.logDecisionf("request denied for client %s: no active knock", m.clientLabel(ip))
 		m.writeError(rw, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
@@ -969,12 +998,12 @@ func (m *middleware) handlePathProtected(rw http.ResponseWriter, req *http.Reque
 func (m *middleware) handleBasicProtected(rw http.ResponseWriter, req *http.Request) {
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
-		m.logf("request denied: %v", err)
+		m.logDecisionf("request denied: %v", err)
 		m.writeError(rw, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
 	if m.cfg.allowlist.contains(ip) {
-		m.logf("request allowed for client %s: static allowlist", m.clientLabel(ip))
+		m.logDecisionf("request allowed for client %s: static allowlist", m.clientLabel(ip))
 		m.serveNext(rw, req, "")
 		return
 	}
@@ -998,7 +1027,7 @@ func (m *middleware) handleBasicProtected(rw http.ResponseWriter, req *http.Requ
 
 	user, ok := m.cfg.users.authenticate(username, password)
 	if !ok {
-		m.logf("basic auth failed for client %s", m.clientLabel(ip))
+		m.logDecisionf("basic auth failed for client %s", m.clientLabel(ip))
 		m.writeBasicChallenge(rw)
 		return
 	}
@@ -1013,13 +1042,13 @@ func (m *middleware) handleBasicProtected(rw http.ResponseWriter, req *http.Requ
 func (m *middleware) handlePasswordProtected(rw http.ResponseWriter, req *http.Request) {
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
-		m.logf("request denied: %v", err)
+		m.logDecisionf("request denied: %v", err)
 		m.writeError(rw, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
 
 	if m.cfg.allowlist.contains(ip) {
-		m.logf("request allowed for client %s: static allowlist", m.clientLabel(ip))
+		m.logDecisionf("request allowed for client %s: static allowlist", m.clientLabel(ip))
 		m.serveNext(rw, req, "")
 		return
 	}
@@ -1078,7 +1107,7 @@ func (m *middleware) handlePasswordProtected(rw http.ResponseWriter, req *http.R
 		}
 	}
 
-	m.logf("request denied for client %s: no valid session or grant", m.clientLabel(ip))
+	m.logDecisionf("request denied for client %s: no valid session or grant", m.clientLabel(ip))
 	m.writeError(rw, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 }
 
@@ -1123,7 +1152,7 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 	// those before touching any state: SameSite cookies do not prevent a
 	// cross-site form from logging a victim into an attacker's account.
 	if !sameOriginPost(req) {
-		m.logf("login/logout rejected: cross-origin request")
+		m.logDecisionf("login/logout rejected: cross-origin request")
 		m.writeLoginError(rw, req, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
@@ -1141,7 +1170,7 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 
 	ip, err := clientIPFromRequest(req, m.cfg.clientIPHeader)
 	if err != nil {
-		m.logf("login rejected: %v", err)
+		m.logDecisionf("login rejected: %v", err)
 		m.writeLoginError(rw, req, http.StatusForbidden, http.StatusText(http.StatusForbidden))
 		return
 	}
@@ -1174,7 +1203,7 @@ func (m *middleware) handleLoginPost(rw http.ResponseWriter, req *http.Request) 
 	user, ok := m.cfg.users.authenticate(username, password)
 	if !ok {
 		// The failed attempt was already counted by reserveLoginAttempt.
-		m.logf("login failed for client %s", m.clientLabel(ip))
+		m.logDecisionf("login failed for client %s", m.clientLabel(ip))
 		if wantsJSON(req) {
 			m.writeJSON(rw, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
 			return
@@ -1388,14 +1417,14 @@ func (m *middleware) redirectAfterLogout(rw http.ResponseWriter) {
 
 func (m *middleware) writeBasicChallenge(rw http.ResponseWriter) {
 	setNoStore(rw.Header())
-	rw.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=%q, charset=\"UTF-8\"", m.cfg.realm))
+	rw.Header().Set("WWW-Authenticate", m.cfg.basicChallenge)
 	http.Error(rw, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 }
 
 func (m *middleware) writeUnauthorized(rw http.ResponseWriter, scheme string) {
 	setNoStore(rw.Header())
 	if scheme == "bearer" {
-		rw.Header().Set("WWW-Authenticate", fmt.Sprintf("Bearer realm=%q", m.cfg.realm))
+		rw.Header().Set("WWW-Authenticate", m.cfg.bearerChallenge)
 	}
 	http.Error(rw, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 }
@@ -1425,11 +1454,9 @@ func (m *middleware) writeError(rw http.ResponseWriter, status int, message stri
 func (m *middleware) serveNext(rw http.ResponseWriter, req *http.Request, username string) {
 	m.applyForwardUser(req, username)
 	if m.cfg.privateResponses {
-		// Set the headers before the backend runs as well, so a backend that
-		// returns without writing still cannot leave an implicit 200 cacheable.
-		// The wrapper re-applies them at WriteHeader time in case the backend
-		// overwrites or weakens them.
-		applyPrivateHeaders(rw.Header())
+		// The wrapper applies the headers at WriteHeader/Write/ReadFrom/Flush
+		// time and finish() covers a backend that returns without writing, so
+		// the header map does not need to be parsed twice per response.
 		private := newPrivateResponseWriter(rw)
 		m.next.ServeHTTP(private, req)
 		private.finish()
@@ -1479,6 +1506,16 @@ func (m *middleware) logf(format string, args ...interface{}) {
 		return
 	}
 	m.logger.Printf(format, args...)
+}
+
+// logDecisionf logs high-volume per-request allow/deny and failed-auth events.
+// It is a no-op unless logDecisions is enabled; errors and successful auth
+// events go through logf so they are not lost.
+func (m *middleware) logDecisionf(format string, args ...interface{}) {
+	if !m.cfg.logDecisions {
+		return
+	}
+	m.logf(format, args...)
 }
 
 // clientLabel hides the client IP unless the operator opted into logging it.

@@ -24,11 +24,12 @@ const (
 	pbkdf2Algorithm = "pbkdf2-sha256"
 	// DefaultPBKDF2Iterations is used by HashPassword when no explicit
 	// iteration count is given. Verification uses the count stored in the hash,
-	// so this value can be raised later without invalidating existing hashes.
-	// The default follows the OWASP recommendation for PBKDF2-HMAC-SHA256
-	// (600,000 iterations); hashes created with the previous 120,000 default
-	// keep verifying with their stored count.
-	DefaultPBKDF2Iterations = 600000
+	// so this value can be changed later without invalidating existing hashes.
+	// 120,000 keeps password/Basic verification usable under Yaegi (Traefik's
+	// interpreter) while still being a costly KDF. Hashes with a higher count
+	// such as the OWASP 600,000 recommendation keep verifying; see the README
+	// "Performance and tuning" section before choosing one.
+	DefaultPBKDF2Iterations = 120000
 
 	minPBKDF2Iterations = 10000
 	maxPBKDF2Iterations = 10000000
@@ -150,13 +151,16 @@ func pbkdf2SHA256(password, salt []byte, iterations, keyLength int) []byte {
 		binary.BigEndian.PutUint32(blockIndex[:], uint32(block))
 		_, _ = prf.Write(blockIndex[:])
 
-		copy(u[:], prf.Sum(nil))
+		// Sum into u's existing capacity instead of passing nil: Sum(nil)
+		// allocates a fresh slice on every iteration, which at 600,000
+		// iterations means ~19 MiB of garbage per verification.
+		copy(u[:], prf.Sum(u[:0]))
 		copy(t[:], u[:])
 
 		for i := 1; i < iterations; i++ {
 			prf.Reset()
 			_, _ = prf.Write(u[:])
-			copy(u[:], prf.Sum(nil))
+			copy(u[:], prf.Sum(u[:0]))
 			for j := 0; j < len(t); j++ {
 				t[j] ^= u[j]
 			}

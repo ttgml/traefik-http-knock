@@ -4,6 +4,10 @@
 //	# enter the password when prompted (input is read from stdin)
 //
 // The output can be pasted into the plugin's users list or a credentials file.
+// The default is 120,000 iterations, which keeps verification usable under
+// Yaegi (Traefik's interpreter). Use -iterations to pick a higher count for
+// stronger offline-cracking resistance (for example 600000); see the README
+// "Performance and tuning" section.
 package main
 
 import (

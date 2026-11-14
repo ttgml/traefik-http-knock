@@ -817,3 +817,58 @@ func TestRedisSetExStoresArbitraryValue(t *testing.T) {
 		t.Fatalf("value = %q, want alice|fingerprint", value)
 	}
 }
+
+func TestRedisDoesNotRetryReadTimeouts(t *testing.T) {
+	srv := startFakeRedis(t)
+	client := newTestRedisClient(t, srv.addr(), func(o *redisOptions) {
+		o.readTimeout = 20 * time.Millisecond
+		o.writeTimeout = 20 * time.Millisecond
+	})
+
+	release := srv.blockCommands()
+	defer release()
+
+	if _, err := client.exists("key"); err == nil {
+		t.Fatal("expected a read timeout")
+	}
+
+	// A timeout usually means the server is overloaded, so the client must not
+	// immediately retry and double the load. Give a retry (if any) time to
+	// reach the fake server before counting.
+	time.Sleep(50 * time.Millisecond)
+	count := 0
+	for _, cmd := range srv.recordedCommands() {
+		if cmd == "EXISTS key" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("EXISTS was attempted %d times, want 1 (no retry on timeout)", count)
+	}
+}
+
+func TestRedisPoolWaitTimeout(t *testing.T) {
+	srv := startFakeRedis(t)
+	client := newTestRedisClient(t, srv.addr(), func(o *redisOptions) {
+		o.maxConns = 1
+		o.poolWaitTimeout = 30 * time.Millisecond
+	})
+
+	conn, err := client.get()
+	if err != nil {
+		t.Fatalf("first get: %v", err)
+	}
+	defer client.put(conn, nil)
+
+	start := time.Now()
+	if _, err := client.get(); !errors.Is(err, errPoolExhausted) {
+		t.Fatalf("expected errPoolExhausted, got %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 20*time.Millisecond {
+		t.Fatalf("pool wait returned too early: %s", elapsed)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("pool wait ignored poolWaitTimeout: %s", elapsed)
+	}
+}

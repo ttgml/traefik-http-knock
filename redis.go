@@ -262,14 +262,15 @@ func ioReadFull(r *bufio.Reader, buf []byte) (int, error) {
 
 // redisOptions configures a redisClient.
 type redisOptions struct {
-	addr         string
-	username     string
-	password     string
-	db           int
-	dialTimeout  time.Duration
-	readTimeout  time.Duration
-	writeTimeout time.Duration
-	maxConns     int
+	addr            string
+	username        string
+	password        string
+	db              int
+	dialTimeout     time.Duration
+	readTimeout     time.Duration
+	writeTimeout    time.Duration
+	poolWaitTimeout time.Duration
+	maxConns        int
 }
 
 // redisClient is a small, bounded connection pool.
@@ -404,15 +405,16 @@ func (c *redisClient) ping() error {
 }
 
 // doIdempotent runs a command that is safe to repeat (EXISTS, SET, PING) and
-// retries once on a transport failure.
+// retries once on a non-timeout transport failure.
 //
 // This hides the most common Redis outage mode: a pooled socket that a Redis
 // restart, a load balancer or the Redis idle timeout silently invalidated. The
 // first attempt discovers the dead socket, the retry uses a fresh connection.
 //
 // Failures that happened before a socket was obtained (dial failure, pool
-// exhaustion, closed client) are not retried, so a genuinely unreachable Redis
-// still fails after a single dial timeout.
+// exhaustion, closed client) and read/write timeouts are not retried. A
+// genuinely unreachable Redis fails after a single dial timeout, and a slow
+// Redis is not hit twice while it is already overloaded.
 //
 // NOTE: the plugin deliberately avoids errors.Is/errors.As. Yaegi (the
 // interpreter used for local plugins) panics on those stdlib helpers, so error
@@ -432,6 +434,12 @@ func (c *redisClient) doIdempotent(args ...string) (respValue, error) {
 		// the connection is still in sync.
 		return respValue{}, err
 	}
+	if isTimeoutError(err) {
+		// A timeout usually means Redis or the network is overloaded. Retrying
+		// immediately would double the load and the caller's latency; report
+		// the timeout instead.
+		return respValue{}, err
+	}
 	return c.do(args...)
 }
 
@@ -441,6 +449,16 @@ func (c *redisClient) doIdempotent(args ...string) (respValue, error) {
 func isServerError(err error) bool {
 	_, ok := err.(redisError)
 	return ok
+}
+
+// isTimeoutError reports whether err is a network timeout. The errors from
+// net.Conn are not wrapped by this package, so a direct type assertion is
+// sufficient (and Yaegi-safe).
+func isTimeoutError(err error) bool {
+	if ne, ok := err.(net.Error); ok {
+		return ne.Timeout()
+	}
+	return false
 }
 
 // do runs a command on a pooled connection exactly once.
@@ -511,8 +529,12 @@ func (c *redisClient) get() (*redisConn, error) {
 	c.mu.Unlock()
 
 	// The pool is saturated. Wait for a connection to come back rather than
-	// opening unbounded connections.
-	wait := c.opts.readTimeout + c.opts.writeTimeout
+	// opening unbounded connections. Callers that built redisOptions by hand
+	// without poolWaitTimeout keep the old read+write bound.
+	wait := c.opts.poolWaitTimeout
+	if wait <= 0 {
+		wait = c.opts.readTimeout + c.opts.writeTimeout
+	}
 	if wait <= 0 {
 		wait = time.Second
 	}

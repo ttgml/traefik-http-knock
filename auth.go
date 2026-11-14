@@ -44,9 +44,9 @@ const (
 //
 //	users:
 //	  - username: alice
-//	    passwordHash: "pbkdf2-sha256$600000$...$..."
+//	    passwordHash: "pbkdf2-sha256$120000$...$..."
 //	  - username: bob
-//	    passwordHash: "pbkdf2-sha256$600000$...$..."
+//	    passwordHash: "pbkdf2-sha256$120000$...$..."
 //
 // Username may be empty for a shared password. Password may be set instead of
 // PasswordHash for local development/tests; production deployments should use
@@ -222,8 +222,12 @@ func (s *userSet) authenticate(username, password string) (*userCredential, bool
 
 	var matched *userCredential
 	for _, user := range s.shared {
-		if user.verifyPassword(password) && matched == nil {
+		if user.verifyPassword(password) {
 			matched = user
+			// Every shared credential grants the same access and has no
+			// username to attribute it to, so there is no reason to run the
+			// expensive KDF for the remaining entries after a match.
+			break
 		}
 	}
 	if matched != nil {

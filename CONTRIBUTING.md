@@ -59,6 +59,13 @@ make test
 make race
 ```
 
+Performance checks (compiled Go; Yaegi is much slower for PBKDF2 loops, so
+measure password/Basic latency through `make e2e` or a real Traefik container):
+
+```bash
+go test -run '^$' -bench 'Benchmark(PBKDF2SHA256|AuthenticateSharedFirstMatch)' -benchmem
+```
+
 The unit tests use an in-process fake Redis server, so no Docker is required.
 They cover path mode, password login, multiple users, sessions,
 logout/revocation, Basic auth, Bearer tokens, realm isolation, login rate

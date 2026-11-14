@@ -50,16 +50,9 @@ func remoteIP(remoteAddr string) (string, error) {
 	if remoteAddr == "" {
 		return "", errNoClientIP
 	}
-
-	host := remoteAddr
-	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		host = h
-	} else if strings.HasPrefix(remoteAddr, "[") && strings.HasSuffix(remoteAddr, "]") {
-		// "[2001:db8::1]" without port.
-		host = strings.TrimSuffix(strings.TrimPrefix(remoteAddr, "["), "]")
-	}
-
-	return normalizeIP(host)
+	// normalizeIP already understands bare IPs, host:port and bracketed IPv6.
+	// Delegating avoids parsing the same address twice per request.
+	return normalizeIP(remoteAddr)
 }
 
 // normalizeIP validates raw and returns its canonical textual form. Using the
@@ -69,6 +62,13 @@ func normalizeIP(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", errNoClientIP
+	}
+
+	// Fast path for the common case: a bare IPv4/IPv6 address. Client headers
+	// usually carry a bare address, and RemoteAddr is often bare in tests and
+	// some proxies.
+	if ip := net.ParseIP(raw); ip != nil {
+		return ip.String(), nil
 	}
 
 	// Drop an IPv6 zone identifier ("fe80::1%eth0") before parsing.
@@ -143,7 +143,9 @@ func validHeaderName(name string) bool {
 // The zero value matches nothing, so an omitted configuration never allows
 // anyone.
 type staticAllowlist struct {
-	ips      []net.IP
+	// ips uses the canonical string form as the key so the request path can
+	// avoid net.ParseIP when the allowlist only contains single addresses.
+	ips      map[string]struct{}
 	networks []*net.IPNet
 }
 
@@ -152,7 +154,7 @@ type staticAllowlist struct {
 // ("10.0.0.0/8", "2001:db8::/32"). Entries are validated at configuration time
 // so a typo can never silently allow or deny the wrong clients.
 func parseStaticAllowlist(entries []string) (*staticAllowlist, error) {
-	allow := &staticAllowlist{}
+	allow := &staticAllowlist{ips: make(map[string]struct{})}
 	for _, raw := range entries {
 		entry := strings.TrimSpace(raw)
 		if entry == "" {
@@ -170,7 +172,7 @@ func parseStaticAllowlist(entries []string) (*staticAllowlist, error) {
 		if ip == nil {
 			return nil, fmt.Errorf("http-knock: staticAllowlist entry %q is not a valid IP address", entry)
 		}
-		allow.ips = append(allow.ips, ip)
+		allow.ips[ip.String()] = struct{}{}
 	}
 	return allow, nil
 }
@@ -181,14 +183,15 @@ func (a *staticAllowlist) contains(clientIP string) bool {
 	if a == nil || (len(a.ips) == 0 && len(a.networks) == 0) {
 		return false
 	}
+	if _, ok := a.ips[clientIP]; ok {
+		return true
+	}
+	if len(a.networks) == 0 {
+		return false
+	}
 	ip := net.ParseIP(clientIP)
 	if ip == nil {
 		return false
-	}
-	for _, candidate := range a.ips {
-		if candidate.Equal(ip) {
-			return true
-		}
 	}
 	for _, network := range a.networks {
 		if network.Contains(ip) {

@@ -3,6 +3,7 @@ package traefik_http_knock
 import (
 	"bufio"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -37,7 +38,13 @@ func (w *privateResponseWriter) applyPrivateHeaders() {
 // revalidation. Shared-cache-only directives (public, s-maxage) are dropped.
 func applyPrivateHeaders(header http.Header) {
 	if !hasNoStore(header) {
-		header.Set("Cache-Control", privateCacheControl(header.Values("Cache-Control")))
+		if len(header.Values("Cache-Control")) == 0 {
+			// Most backends do not set Cache-Control; avoid allocating a
+			// directive slice and joining it just to produce "private".
+			header.Set("Cache-Control", "private")
+		} else {
+			header.Set("Cache-Control", privateCacheControl(header.Values("Cache-Control")))
+		}
 	}
 	addVary(header, "Cookie")
 	addVary(header, "Authorization")
@@ -111,6 +118,21 @@ func (w *privateResponseWriter) Write(body []byte) (int, error) {
 		w.WriteHeader(http.StatusOK)
 	}
 	return w.ResponseWriter.Write(body)
+}
+
+// ReadFrom forwards to the underlying writer's ReadFrom when it implements
+// io.ReaderFrom. net/http's response does, and uses it for the sendfile
+// fast path on large bodies. Without this method io.Copy sees only the wrapper,
+// falls back to a generic buffer copy, and sends every chunk through Write
+// (which is interpreted when the plugin runs under Yaegi).
+func (w *privateResponseWriter) ReadFrom(src io.Reader) (int64, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		return rf.ReadFrom(src)
+	}
+	return io.Copy(w.ResponseWriter, src)
 }
 
 func (w *privateResponseWriter) Flush() {

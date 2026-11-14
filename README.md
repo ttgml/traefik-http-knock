@@ -122,14 +122,14 @@ Generate a password hash from a repository checkout:
 
 ```bash
 go run ./cmd/knockhash
-# pbkdf2-sha256$600000$...
+# pbkdf2-sha256$120000$...
 ```
 
 Or a full credentials-file line:
 
 ```bash
 go run ./cmd/knockhash -username alice
-# alice:pbkdf2-sha256$600000$...
+# alice:pbkdf2-sha256$120000$...
 ```
 
 Minimal middleware:
@@ -144,7 +144,7 @@ spec:
       grantMode: session             # session | ip | both
       users:
         - username: alice
-          passwordHash: "pbkdf2-sha256$600000$BASE64_SALT$BASE64_HASH"
+          passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
       cookieSecretFile: "/etc/traefik/secrets/http-knock-cookie-secret"
       sessionTTL: "12h"
       redisAddr: "redis.traefik-http-knock.svc.cluster.local:6379"
@@ -203,7 +203,7 @@ spec:
       authMode: basic
       users:
         - username: api
-          passwordHash: "pbkdf2-sha256$600000$BASE64_SALT$BASE64_HASH"
+          passwordHash: "pbkdf2-sha256$120000$BASE64_SALT$BASE64_HASH"
       privateResponses: true
 ```
 
@@ -212,12 +212,19 @@ curl -i -u api:'...' https://example.com/
 ```
 
 Basic mode is stateless and does not use Redis. Every request runs a PBKDF2
-verification (tens to low hundreds of milliseconds with the default 600,000
-iterations), so it is CPU-bound
-and has no per-IP login rate limit; `maxConcurrentLogins` only bounds concurrent
-verifications. Put a Traefik `rateLimit` middleware in front of it, and prefer it
-for API/CLI clients over HTTPS. A request without credentials gets `401` with a
-`WWW-Authenticate` challenge.
+verification, so it is CPU-bound and has no per-IP login rate limit;
+`maxConcurrentLogins` only bounds concurrent verifications. Put a Traefik
+`rateLimit` middleware in front of it, and prefer it for API/CLI clients over
+HTTPS. A request without credentials gets `401` with a `WWW-Authenticate`
+challenge.
+
+Performance warning: Traefik runs Go plugins under Yaegi. The default
+120,000-iteration PBKDF2 costs roughly 0.5 s per verification there (~0.05 s
+compiled), and Basic repeats that work on every request; at the stronger
+600,000-iteration setting it is about 2.7 s. Basic is therefore not suitable for
+high-traffic APIs. Use password mode plus a Bearer token for API clients (one
+login, then a Redis session lookup per request), or choose a lower iteration
+count after a risk review. See [Performance and tuning](#performance-and-tuning).
 
 ## Configuration reference
 
@@ -240,8 +247,10 @@ Common fields:
 | `clientIPHeader` | empty (use `RemoteAddr`) | Only set behind a trusted proxy that overwrites it. |
 | `failClosed` | `true` | Return `503` when Redis is unreachable. |
 | `dialTimeout` / `readTimeout` / `writeTimeout` | `2s` / `1s` / `1s` | Redis timeouts. |
-| `redisPoolSize` | `16` | Maximum pooled Redis connections. |
+| `redisPoolSize` | `16` | Maximum pooled Redis connections, per middleware instance. |
+| `poolWaitTimeout` | `2s` | How long a request waits for a free Redis connection before failing with a pool-exhausted error. |
 | `logClientIP` | `false` | Log client IPs instead of `redacted`. |
+| `logDecisions` | `false` | Log every allow/deny decision and failed authentication attempt. Off by default; Redis errors and successful knocks/logins are still logged. |
 | `privateResponses` | `true` | Add `Cache-Control: private` and `Vary` to protected responses. Set `false` only when shared caching is intentional. |
 | `forwardUserHeader` | empty | Forward the authenticated username (session/Basic only; IP grants are anonymous). Client values are stripped first. |
 
@@ -249,7 +258,7 @@ Password-related fields:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `users` | — | Inline `username` + `passwordHash` (or `password`, development only). |
+| `users` | — | Inline `username` + `passwordHash` (or `password`, development only). Omit `username` for a shared single-password entry. |
 | `credentialsFile` / `credentialsEnv` | empty | `username:hash` lines, or a shared `hash` line. `#` comments and blank lines are ignored. |
 | `cookieSecret` / `cookieSecretFile` / `cookieSecretEnv` | — | Session-signing secret, at least 32 bytes; required for `grantMode: session`/`both`, optional for `ip`. File takes precedence. |
 | `cookieName` | realm-derived `__Host-` name | Session cookie name. |
@@ -279,14 +288,71 @@ Notes:
   it is still validated if provided. Basic and path mode ignore cookie settings.
 * `staticAllowlist` bypasses authentication in password and Basic mode, not
   just the Redis lookup. Only list networks you fully trust.
-* New password hashes use 600,000 PBKDF2 iterations by default. Existing hashes
-  keep the iteration count stored in the hash and continue to verify.
+* New password hashes use 120,000 PBKDF2 iterations by default. Existing hashes
+  keep the iteration count stored in the hash and continue to verify, including
+  the stronger 600,000 count. Under Yaegi the default costs about 0.5 s per
+  verification and 600,000 costs about 2.7 s; see
+  [Performance and tuning](#performance-and-tuning) before choosing a count for
+  password or Basic mode.
+* `logDecisions` is off by default. Every denied request and failed login would
+  otherwise write to stderr; on a busy or scanned site that logging can
+  serialize on the logger. Traefik access logs still record every request.
+  `logClientIP` only affects messages that are actually logged; enable
+  `logDecisions` as well to see per-request denials.
+* `redisPoolSize` and `maxConcurrentLogins` are per middleware instance. Several
+  Middleware resources multiply both, so tune them when you split routers into
+  independent configurations.
 * Path mode now defaults `privateResponses` to `true` like the other modes. Set
   it to `false` explicitly only if a shared cache is allowed to store protected
   responses; older path-mode configs that relied on the previous default need
   that opt-out.
 * Upgrading from v0.1.x: Redis keys are now realm-scoped, so old grants are
   ignored and clients simply knock/log in again.
+
+## Performance and tuning
+
+Traefik loads Go plugins with Yaegi, an interpreter. Tight loops run much slower
+than compiled Go; standard-library calls such as SHA-256 and HMAC are native, but
+the loop around them is interpreted.
+
+Measured on an Intel i5-8500B with Traefik v3.2.5, Yaegi v0.16.1 and a local
+Redis (absolute numbers vary by CPU and deployment):
+
+| Workload | Compiled Go | Traefik + Yaegi |
+| --- | --- | --- |
+| PBKDF2-SHA256, 120,000 iterations (default) | ~0.05 s | ~0.53 s |
+| PBKDF2-SHA256, 600,000 iterations | ~0.28 s | ~2.7 s |
+| Protected request with a session (one Redis GET) | ~1 ms | ~2-8 ms |
+
+Guidance:
+
+* Path mode and password/session requests after login perform no KDF. Their cost
+  is one Redis round trip plus plugin dispatch; keep Redis close and size
+  `redisPoolSize` for the expected concurrency.
+* Password mode performs the KDF at login. At the 120,000 default the default
+  `maxConcurrentLogins: 4` caps one Traefik process at roughly 7.5 logins/s; at
+  600,000 it is roughly 1.5 logins/s. Use a long `sessionTTL`, tune
+  `maxConcurrentLogins` to the available CPU, and add edge rate limiting. If
+  0.5 s per login is still too slow, lower the count after a risk review:
+  `go run ./cmd/knockhash -iterations 100000`. The hash stores its own iteration
+  count, so different counts can coexist. Raise it to 600,000 when stronger
+  offline-cracking resistance matters more than login latency.
+* Basic mode performs the KDF on every request. At the 120,000 default under
+  Yaegi it is about 0.5 s per request; at 600,000 it is seconds. Do not use it
+  for high-traffic APIs; prefer password mode with a Bearer token, or a lower
+  iteration count after a risk review.
+* `logDecisions` is off by default; enable it only for low-traffic debugging or
+  audit. Successful knocks/logins, Redis failures and configuration errors are
+  still logged.
+* `redisPoolSize`, `poolWaitTimeout` and `maxConcurrentLogins` are per middleware
+  instance. Many Middleware resources (for example one per router) multiply
+  connection and CPU limits.
+
+Benchmarks:
+
+```bash
+go test -run '^$' -bench 'Benchmark(PBKDF2SHA256|AuthenticateSharedFirstMatch)' -benchmem
+```
 
 ## Deployment
 
@@ -399,10 +465,12 @@ kubectl -n traefik-http-knock exec deploy/redis -- \
   enforces 6-80 characters but only a random secret is hard to guess. Rotate it
   by changing the value and rolling the middleware.
 * **Passwords.** Prefer `passwordHash` or a Secret-mounted `credentialsFile` over
-  plaintext. New hashes default to 600,000 PBKDF2-HMAC-SHA256 iterations (the
-  OWASP recommendation); per-IP login attempt limiting and bounded concurrent
-  KDFs are built in. Use one username per person if you need attribution or
-  per-person revocation.
+  plaintext. New hashes default to 120,000 PBKDF2-HMAC-SHA256 iterations, chosen
+  so password/Basic verification remains usable under Yaegi; 600,000 is stronger
+  against offline cracking but costs about 2.7 s per verification there. Per-IP
+  login attempt limiting and bounded concurrent KDFs are built in. Review
+  [Performance and tuning](#performance-and-tuning) before changing the count.
+  Use one username per person if you need attribution or per-person revocation.
 * **Session cookie.** Requires a separate random `cookieSecret` (≥ 32 bytes)
   shared by all replicas, and HTTPS. Cookies are `HttpOnly`, `Secure`,
   `SameSite=Lax` and use a realm-derived `__Host-` name by default.

@@ -3,6 +3,7 @@ package traefik_http_knock
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -98,6 +99,72 @@ func TestPrivateResponseWriterSetsHeadersOnWrite(t *testing.T) {
 	w := newPrivateResponseWriter(rw)
 	if _, err := w.Write([]byte("ok")); err != nil {
 		t.Fatalf("Write: %v", err)
+	}
+	if got := rw.Header().Get("Cache-Control"); got != "private" {
+		t.Fatalf("Cache-Control = %q, want private", got)
+	}
+	if len(rw.statuses) != 1 || rw.statuses[0] != http.StatusOK {
+		t.Fatalf("statuses = %v, want [200]", rw.statuses)
+	}
+}
+
+// readFromWriter records calls to ReadFrom so the wrapper can prove that it
+// keeps net/http's sendfile fast path reachable.
+type readFromWriter struct {
+	statusWriter
+	readFromCalls int
+}
+
+func (w *readFromWriter) ReadFrom(src io.Reader) (int64, error) {
+	w.readFromCalls++
+	if len(w.statuses) == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	// writerOnly hides this type's ReadFrom method from io.Copy, otherwise the
+	// copy would recurse back into ReadFrom.
+	return io.Copy(writerOnly{w}, src)
+}
+
+type writerOnly struct{ io.Writer }
+
+func TestPrivateResponseWriterForwardsReadFrom(t *testing.T) {
+	rw := &readFromWriter{statusWriter: *newStatusWriter()}
+	w := newPrivateResponseWriter(rw)
+
+	n, err := w.ReadFrom(strings.NewReader("hello"))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if n != int64(len("hello")) {
+		t.Fatalf("ReadFrom copied %d bytes, want %d", n, len("hello"))
+	}
+	if rw.readFromCalls != 1 {
+		t.Fatalf("underlying ReadFrom calls = %d, want 1", rw.readFromCalls)
+	}
+	if got := rw.body.String(); got != "hello" {
+		t.Fatalf("body = %q, want hello", got)
+	}
+	if got := rw.Header().Get("Cache-Control"); got != "private" {
+		t.Fatalf("Cache-Control = %q, want private", got)
+	}
+	if len(rw.statuses) != 1 || rw.statuses[0] != http.StatusOK {
+		t.Fatalf("statuses = %v, want [200]", rw.statuses)
+	}
+}
+
+func TestPrivateResponseWriterReadFromFallback(t *testing.T) {
+	rw := newStatusWriter()
+	w := newPrivateResponseWriter(rw)
+
+	n, err := w.ReadFrom(strings.NewReader("fallback"))
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if n != int64(len("fallback")) {
+		t.Fatalf("ReadFrom copied %d bytes, want %d", n, len("fallback"))
+	}
+	if got := rw.body.String(); got != "fallback" {
+		t.Fatalf("body = %q, want fallback", got)
 	}
 	if got := rw.Header().Get("Cache-Control"); got != "private" {
 		t.Fatalf("Cache-Control = %q, want private", got)

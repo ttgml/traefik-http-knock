@@ -1,11 +1,47 @@
-# Compose override for the CI/local end-to-end smoke test. It reuses the Redis
-# and whoami services from docker-compose.yml but swaps in the tracked e2e
-# Traefik configuration and exposes the password/basic entrypoints.
+# Standalone stack for the end-to-end smoke test, driven by
+# .github/scripts/e2e-compose.sh.
+#
+# It deliberately does not extend docker-compose.yml: CI runners may execute a
+# job inside a container whose workspace does not exist on the Docker host, so
+# relative bind mounts would silently become empty directories. The e2e build
+# stage bakes the Traefik configuration into the image instead.
+name: knock-e2e
+
 services:
+  redis:
+    image: redis:7.4-alpine
+    command:
+      - redis-server
+      - "--requirepass"
+      - devpassword
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -a devpassword ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  whoami:
+    image: traefik/whoami:v1.10.1
+
   traefik:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: e2e
+      args:
+        PLUGIN_MODULE: github.com/ttgml/traefik-http-knock
+    command:
+      - --configFile=/etc/traefik/traefik-compose.yml
     ports:
+      - "8000:8000"
       - "8001:8001"
       - "8002:8002"
-    volumes:
-      - ./.github/e2e/traefik.yml:/etc/traefik/traefik-compose.yml:ro
-      - ./.github/e2e/dynamic.yml:/etc/traefik/dynamic.yml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      whoami:
+        condition: service_started

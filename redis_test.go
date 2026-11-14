@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -329,6 +331,42 @@ func TestRedisCloseReleasesConnections(t *testing.T) {
 	}
 }
 
+// integrationRedisAddr picks a reachable Redis address. Containerized CI jobs
+// (the Gitea act_runner, for example) run the job in its own container and give
+// service containers only a network alias, so 127.0.0.1 inside the job is not
+// the Redis service. Try the configured address first, then the same port on
+// the service name or on loopback.
+func integrationRedisAddr(t *testing.T, configured string) string {
+	t.Helper()
+
+	candidates := []string{configured}
+	host, port, err := net.SplitHostPort(configured)
+	if err == nil {
+		switch strings.ToLower(host) {
+		case "127.0.0.1", "localhost", "::1":
+			candidates = append(candidates, net.JoinHostPort("redis", port))
+		case "redis":
+			candidates = append(candidates, net.JoinHostPort("127.0.0.1", port))
+		}
+	}
+
+	var attempts []string
+	for _, addr := range candidates {
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
+		if err != nil {
+			attempts = append(attempts, fmt.Sprintf("%s: %v", addr, err))
+			continue
+		}
+		_ = conn.Close()
+		if addr != configured {
+			t.Logf("REDIS_ADDR %s is unreachable, using %s instead", configured, addr)
+		}
+		return addr
+	}
+	t.Fatalf("no reachable Redis (tried %s)", strings.Join(attempts, "; "))
+	return ""
+}
+
 // TestRedisIntegrationTTL exercises the real Redis implementation when
 // REDIS_ADDR is provided, for example through docker compose or testcontainers:
 //
@@ -338,6 +376,7 @@ func TestRedisIntegrationTTL(t *testing.T) {
 	if addr == "" {
 		t.Skip("REDIS_ADDR is not set, skipping Redis integration test")
 	}
+	addr = integrationRedisAddr(t, addr)
 
 	opts := redisOptions{
 		addr:         addr,

@@ -7,15 +7,39 @@
 #
 #   make e2e
 #   bash .github/scripts/e2e-compose.sh
-#   E2E_SKIP_BUILD=1 bash .github/scripts/e2e-compose.sh  # reuse an existing image
+#   E2E_SKIP_BUILD=1 bash .github/scripts/e2e-compose.sh  # reuse the e2e image
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-COMPOSE=(docker compose -f docker-compose.yml -f .github/e2e/compose.yml)
-PATH_URL="http://127.0.0.1:8000"
-PASSWORD_URL="http://127.0.0.1:8001"
-BASIC_URL="http://127.0.0.1:8002"
+COMPOSE=(docker compose -f .github/e2e/compose.yml)
+
+# Published ports live on the Docker host. A plain local run reaches them on
+# loopback; inside a CI job container (Gitea act_runner, for example) loopback
+# is the job container itself, so the published ports must be reached through
+# the container's default gateway instead.
+host_addr="127.0.0.1"
+if [ -f /.dockerenv ] || [ -n "${GITEA_ACTIONS:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+	gateway=""
+	if command -v ip >/dev/null 2>&1; then
+		gateway="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')"
+	fi
+	if [ -z "$gateway" ] && [ -r /proc/net/route ]; then
+		# /proc/net/route stores the gateway as little-endian hex bytes.
+		hex="$(awk '$2 == "00000000" {print $3; exit}' /proc/net/route)"
+		if [ -n "$hex" ]; then
+			gateway="$(printf '%d.%d.%d.%d' "0x${hex:6:2}" "0x${hex:4:2}" "0x${hex:2:2}" "0x${hex:0:2}")"
+		fi
+	fi
+	if [ -n "$gateway" ]; then
+		host_addr="$gateway"
+	fi
+fi
+echo "==> reaching published ports on $host_addr"
+
+PATH_URL="http://$host_addr:8000"
+PASSWORD_URL="http://$host_addr:8001"
+BASIC_URL="http://$host_addr:8002"
 KNOCK_SECRET="/__knock__/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 tmpdir="$(mktemp -d)"

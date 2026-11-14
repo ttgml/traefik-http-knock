@@ -1,6 +1,8 @@
 .git
 .gitignore
-.github
+.github/*
+# The e2e image stage bakes these files in (see Dockerfile).
+!.github/e2e/
 *.md
 LICENSE
 Makefile

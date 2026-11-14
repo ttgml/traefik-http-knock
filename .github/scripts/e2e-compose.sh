@@ -14,12 +14,13 @@ cd "$(dirname "$0")/../.."
 
 COMPOSE=(docker compose -f .github/e2e/compose.yml)
 
-# Published ports live on the Docker host. A plain local run reaches them on
-# loopback; inside a CI job container (Gitea act_runner, for example) loopback
-# is the job container itself, so the published ports must be reached through
-# the container's default gateway instead.
+# Published ports live on the Docker host. A plain local run and a
+# GitHub-hosted VM runner reach them on loopback. Inside a CI job container
+# (Gitea act_runner, for example) loopback is the job container itself, so the
+# published ports must be reached through the container's default gateway.
+# GITHUB_ACTIONS alone is not a container signal: GitHub-hosted runners are VMs.
 host_addr="127.0.0.1"
-if [ -f /.dockerenv ] || [ -n "${GITEA_ACTIONS:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
+if [ -f /.dockerenv ] || [ -f /run/.containerenv ] || [ -n "${GITEA_ACTIONS:-}" ]; then
 	gateway=""
 	if command -v ip >/dev/null 2>&1; then
 		gateway="$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')"

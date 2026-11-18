@@ -251,7 +251,7 @@ Common fields:
 | `poolWaitTimeout` | `2s` | How long a request waits for a free Redis connection before failing with a pool-exhausted error. |
 | `logClientIP` | `false` | Log client IPs instead of `redacted`. |
 | `logDecisions` | `false` | Log every allow/deny decision and failed authentication attempt. Off by default; Redis errors and successful knocks/logins are still logged. |
-| `privateResponses` | `true` | Add `Cache-Control: private` and `Vary` to protected responses. Set `false` only when shared caching is intentional. |
+| `privateResponses` | `true` | Add `Cache-Control: private` and `Vary` to protected responses. Responses without a `Content-Length` (SSE, NDJSON, token streams) are flushed as they are written, so streaming keeps working. Set `false` only when shared caching is intentional. |
 | `forwardUserHeader` | empty | Forward the authenticated username (session/Basic only; IP grants are anonymous). Client values are stripped first. |
 
 Password-related fields:
@@ -286,6 +286,13 @@ Notes:
 * A `cookieSecret` rotation invalidates every session.
 * `grantMode: ip` issues no session/token, so `cookieSecret` is optional there;
   it is still validated if provided. Basic and path mode ignore cookie settings.
+* `privateResponses` does not break streaming. Responses without a
+  `Content-Length` are flushed on every write, so SSE (`text/event-stream`),
+  NDJSON and other chunked streams reach the client event by event even though
+  Traefik's reverse proxy cannot flush through a Yaegi wrapper. Responses that
+  declare a length keep normal buffering. See
+  [Yaegi constraints](CONTRIBUTING.md#yaegi-constraints) for why the wrapper
+  flushes itself.
 * `staticAllowlist` bypasses authentication in password and Basic mode, not
   just the Redis lookup. Only list networks you fully trust.
 * New password hashes use 120,000 PBKDF2 iterations by default. Existing hashes
@@ -483,7 +490,8 @@ kubectl -n traefik-http-knock exec deploy/redis -- \
   regardless of this setting.
 * **CDN caching.** `privateResponses` defaults to `true` in every mode; leave it
   enabled so a response authorized by one client cannot be cached and served to
-  another.
+  another. Streaming responses still arrive incrementally, so enabling it does
+  not buffer SSE.
 * **CSRF.** Login/logout POSTs are checked against same-origin headers. A client
   that sends none of them is treated as non-browser and allowed; add a signed
   CSRF token or an edge WAF if that residual risk is unacceptable.

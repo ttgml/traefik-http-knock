@@ -15,11 +15,22 @@ import (
 // authorized by a cookie or Authorization header. Backends sometimes set
 // "Cache-Control: public" themselves, so setting the header before calling the
 // backend is not enough: this wrapper applies the final value at WriteHeader
-// time and preserves the optional ResponseWriter interfaces used by streaming
-// and WebSocket backends.
+// time.
+//
+// Yaegi, the interpreter Traefik uses for local plugins, bridges an interpreted
+// http.ResponseWriter with stdlib._netHTTPResponseWriterHijacker: Header, Write,
+// WriteHeader and Hijack are forwarded, nothing else. http.Flusher and Unwrap
+// are absent, so the reverse proxy's flushes never reach the wrapped writer and
+// a streaming response stays buffered until the backend closes it. Write flushes
+// unframed responses itself; see flushWrites. WebSocket upgrades are unaffected,
+// because the bridge does forward Hijack.
 type privateResponseWriter struct {
 	http.ResponseWriter
 	wroteHeader bool
+	// flushWrites is set when the backend did not declare a Content-Length.
+	// Such a response is chunked or delimited by EOF, which is how streaming
+	// responses (SSE, NDJSON, token streams) are produced.
+	flushWrites bool
 }
 
 func newPrivateResponseWriter(rw http.ResponseWriter) *privateResponseWriter {
@@ -102,6 +113,7 @@ func (w *privateResponseWriter) WriteHeader(statusCode int) {
 	}
 	w.wroteHeader = true
 	w.applyPrivateHeaders()
+	w.flushWrites = !hasContentLength(w.ResponseWriter.Header())
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
@@ -117,7 +129,32 @@ func (w *privateResponseWriter) Write(body []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	return w.ResponseWriter.Write(body)
+	n, err := w.ResponseWriter.Write(body)
+	// Traefik's reverse proxy cannot flush through this wrapper under Yaegi
+	// (see the type comment), so an unframed response must be flushed here or
+	// the client sees nothing until the backend closes the stream. Framed
+	// responses keep net/http's normal buffering.
+	if w.flushWrites {
+		flushWriter(w.ResponseWriter)
+	}
+	return n, err
+}
+
+// flushWriter forwards a flush when the wrapped writer supports it.
+func flushWriter(rw http.ResponseWriter) {
+	if flusher, ok := rw.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// hasContentLength reports whether the backend declared a body length.
+func hasContentLength(header http.Header) bool {
+	for _, value := range header.Values("Content-Length") {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ReadFrom forwards to the underlying writer's ReadFrom when it implements
@@ -139,9 +176,7 @@ func (w *privateResponseWriter) Flush() {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
-		flusher.Flush()
-	}
+	flushWriter(w.ResponseWriter)
 }
 
 func (w *privateResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {

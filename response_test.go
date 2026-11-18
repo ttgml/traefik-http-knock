@@ -6,8 +6,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // statusWriter records every WriteHeader call, including informational 1xx
@@ -235,5 +237,95 @@ func TestPrivateResponseWriterOptionalInterfacesUnsupported(t *testing.T) {
 	}
 	if err := w.Push("/style.css", nil); err != http.ErrNotSupported {
 		t.Fatalf("Push error = %v, want http.ErrNotSupported", err)
+	}
+}
+
+// flusherWriter records Flush calls so the wrapper can prove that it flushes
+// the responses the reverse proxy cannot reach a flusher for.
+type flusherWriter struct {
+	statusWriter
+	flushes int
+}
+
+func (w *flusherWriter) Flush() { w.flushes++ }
+
+func TestPrivateResponseWriterFlushesUnframedWrites(t *testing.T) {
+	rw := &flusherWriter{statusWriter: *newStatusWriter()}
+	rw.Header().Set("Content-Type", "text/event-stream")
+	w := newPrivateResponseWriter(rw)
+
+	for i := 0; i < 3; i++ {
+		if _, err := w.Write([]byte("data: tick\n\n")); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	if rw.flushes != 3 {
+		t.Fatalf("flushes = %d, want one per write (3)", rw.flushes)
+	}
+	if got, want := rw.body.String(), strings.Repeat("data: tick\n\n", 3); got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+	if got := rw.Header().Get("Cache-Control"); got != "private" {
+		t.Fatalf("Cache-Control = %q, want private", got)
+	}
+}
+
+func TestPrivateResponseWriterKeepsFramedResponsesBuffered(t *testing.T) {
+	rw := &flusherWriter{statusWriter: *newStatusWriter()}
+	rw.Header().Set("Content-Length", "5")
+	w := newPrivateResponseWriter(rw)
+
+	if _, err := w.Write([]byte("hello")); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if rw.flushes != 0 {
+		t.Fatalf("flushes = %d, want 0 for a response with Content-Length", rw.flushes)
+	}
+}
+
+// TestPrivateResponseWriterStreamsToClient holds the backend open after the
+// first event. A client must receive that event before the handler returns,
+// which only happens when the wrapper flushes a response without a
+// Content-Length. The backend deliberately never calls Flush: Traefik's reverse
+// proxy is the caller that would normally do it, and under Yaegi it cannot reach
+// the wrapper's Flush method.
+func TestPrivateResponseWriterStreamsToClient(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		w := newPrivateResponseWriter(rw)
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: first\n\n")
+		<-release
+		io.WriteString(w, "data: second\n\n")
+	}))
+	defer srv.Close()
+	defer close(release)
+
+	// The timeout bounds the failure mode this test guards against: a buffered
+	// response also holds back the response headers, so the request itself
+	// blocks until the backend finishes.
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+
+	first := make([]byte, len("data: first\n\n"))
+	read := make(chan error, 1)
+	go func() {
+		_, err := io.ReadFull(resp.Body, first)
+		read <- err
+	}()
+
+	select {
+	case err := <-read:
+		if err != nil {
+			t.Fatalf("reading the first event: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first event was buffered until the handler returned")
 	}
 }

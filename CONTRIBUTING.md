@@ -120,7 +120,7 @@ mount/set a `cookieSecret`.
 
 Local plugins run inside the Yaegi interpreter
 (`github.com/traefik/yaegi` v0.16.1 in Traefik v3.2 and v3.7), not the Go
-runtime. Three rules follow:
+runtime. Four rules follow:
 
 1. **Standard library only.** Every import must be resolvable inside the Traefik
    image. `yaegi_compat_test.go` fails the build on any import whose first path
@@ -136,10 +136,26 @@ runtime. Three rules follow:
    lowercase letters only, which made `clientIPHeader` reject every real header
    name and left `403` on all protected routes.
    `TestYaegiCompatAvoidsMultiExpressionCases` enforces it.
+4. **A wrapped `http.ResponseWriter` cannot flush.** An interpreted value handed
+   back to Go as `http.ResponseWriter` is bridged by Yaegi's composed wrapper
+   `stdlib._netHTTPResponseWriterHijacker` (the only `ResponseWriter`
+   composition in Yaegi v0.16.1). It forwards `Header`/`Write`/`WriteHeader` and
+   `Hijack` — nothing else. `http.Flusher`, `io.ReaderFrom`, `http.Pusher` and
+   `interface{ Unwrap() http.ResponseWriter }` are absent, so
+   `http.NewResponseController(w).Flush()` returns `feature not supported`.
+   Traefik's reverse proxy flushes through exactly that call, which is why
+   `privateResponseWriter` must not rely on it: every write was buffered in
+   net/http until the backend closed the connection, so SSE and other chunked
+   streams hung. `Write` now flushes unframed responses (no `Content-Length`)
+   itself. WebSocket upgrades are unaffected because the bridge does forward
+   `Hijack`. `TestPrivateResponseWriterStreamsToClient` emulates a proxy that
+   never flushes and fails without the self-flush.
 
 Because rules 2 and 3 only misbehave under the interpreter, `go test` cannot
 catch them on its own — the static guards above are what keep the plugin inside
-the Yaegi subset.
+the Yaegi subset. Rule 4 is not statically checkable either;
+`TestPrivateResponseWriterStreamsToClient` emulates a proxy that never flushes,
+and that is the guard.
 
 Verified live against **Traefik v3.2.5 + Redis 7.4** during development:
 
@@ -152,6 +168,8 @@ Verified live against **Traefik v3.2.5 + Redis 7.4** during development:
 | Protected request after the knock | `200`, backend reached |
 | Redis stopped | `503` for knock and protected requests, no panic |
 | Redis `-NOPERM` on `SET` | `503`, connection reused, no panic |
+| SSE stream with `privateResponses: true` | Events delivered as written (HTTP/1.1 and HTTP/2) |
+| WebSocket upgrade with `privateResponses: true` | `101`, frames relayed in both directions |
 
 Password login, Redis session cookies, logout/revocation, the JSON Bearer flow,
 PBKDF2 verification and Basic auth were also exercised under Yaegi v0.16.1 and

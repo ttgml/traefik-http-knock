@@ -1,6 +1,6 @@
 # Builds a Traefik image with the plugin baked in as a local plugin.
 #
-#   docker build -t ghcr.io/ttgml/traefik-http-knock:v0.3.0 .
+#   docker build -t ghcr.io/ttgml/traefik-http-knock:v0.4.3 .
 #
 # The plugin has no third-party dependencies, so no build stage is needed: the
 # Go sources are copied verbatim into Traefik's fixed local-plugin directory and

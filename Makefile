@@ -2,8 +2,8 @@
 MODULE              ?= github.com/ttgml/traefik-http-knock
 TRAEFIK_VERSION     ?= v3.2.5
 IMAGE               ?= ghcr.io/ttgml/traefik-http-knock
-TAG                 ?= v0.3.0
-PLUGIN_VERSION      ?= v0.3.0
+TAG                 ?= v0.4.3
+PLUGIN_VERSION      ?= v0.4.3
 # The plugin ConfigMap must live in the same namespace as the Traefik pod.
 K8S_NAMESPACE       ?= kube-system
 PLUGIN_CONFIGMAP    ?= http-knock-plugin

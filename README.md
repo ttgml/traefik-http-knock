@@ -40,7 +40,7 @@ experimental:
   plugins:
     httpKnock:
       moduleName: github.com/ttgml/traefik-http-knock
-      version: v0.2.1
+      version: v0.4.3
 ```
 
 Or from source: copy this repository to
@@ -53,9 +53,6 @@ experimental:
     httpKnock:
       moduleName: github.com/ttgml/traefik-http-knock
 ```
-
-Password and Basic modes are not part of the v0.2.1 release yet; use the
-local-plugin or custom-image setup from `main` until v0.3.0 is published.
 
 ### 2. Define the middleware
 

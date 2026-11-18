@@ -204,7 +204,7 @@ A catalog release requires:
 * the repository path to equal the module path in `go.mod`,
 * `.traefik.yml` at the repository root with `import:` equal to that module
   path,
-* a semver tag such as `v0.3.0` that Traefik can resolve through the Go module
+* a semver tag such as `v0.4.3` that Traefik can resolve through the Go module
   proxy,
 * no `replace` directives and no dependencies outside the standard library (this
   plugin has none).

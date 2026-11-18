@@ -27,6 +27,11 @@ services:
   whoami:
     image: traefik/whoami:v1.10.1
 
+  # Streaming backend for the SSE check: four events, two seconds apart.
+  sse:
+    build:
+      context: sse
+
   traefik:
     build:
       context: ../..
@@ -44,4 +49,6 @@ services:
       redis:
         condition: service_healthy
       whoami:
+        condition: service_started
+      sse:
         condition: service_started

@@ -26,6 +26,16 @@ http:
         - http-knock-basic
       service: whoami
 
+    # Longer than the whoami rule above, so Traefik gives this router
+    # priority for /events. Basic mode keeps the check independent of Redis.
+    sse-basic:
+      rule: "PathPrefix(`/events`)"
+      entryPoints:
+        - basic
+      middlewares:
+        - http-knock-basic
+      service: sse
+
   middlewares:
     http-knock-path:
       plugin:
@@ -91,3 +101,8 @@ http:
       loadBalancer:
         servers:
           - url: "http://whoami:80"
+
+    sse:
+      loadBalancer:
+        servers:
+          - url: "http://sse:8080"

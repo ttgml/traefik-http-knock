@@ -531,7 +531,7 @@ constraints and release process. Quick checks:
 ```bash
 go test ./...
 go test -race ./...
-make e2e            # Traefik + Yaegi + Redis compose smoke test
+make e2e            # Traefik + Yaegi + Redis compose smoke test (incl. SSE)
 ```
 
 ## License

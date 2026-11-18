@@ -1,13 +1,12 @@
 name: ci
 
 on:
+  # Only version tags trigger the workflow. A release is the only event that
+  # needs the full matrix, and the publish job below is tag-only anyway; branch
+  # pushes and pull requests are deliberately ignored so routine work is
+  # verified locally with `make check` and `make e2e`.
   push:
-    branches: ["**"]
     tags: ["v*"]
-  pull_request:
-  # Lets a run be started from the Gitea UI or the API, for example to verify
-  # a runner or an Actions settings change without pushing a commit.
-  workflow_dispatch:
 
 permissions:
   contents: read

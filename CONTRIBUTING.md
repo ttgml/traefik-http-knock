@@ -217,8 +217,9 @@ git push origin <next-version>
 ```
 
 CI runs `fmt`, `vet`, `test`, `test -race`, the Redis integration test and the
-Traefik + Yaegi end-to-end smoke test on every push and pull request; publishing
-runs only for `v*` tags.
+Traefik + Yaegi end-to-end smoke test for every `v*` tag push, and publishes the
+image when that tag is pushed to GitHub. Branch pushes and pull requests do not
+trigger anything: run `make check` and `make e2e` locally before tagging.
 
 ## Reporting security issues
 

@@ -32,6 +32,25 @@ func newTestRedisClient(t *testing.T, addr string, mutate ...func(*redisOptions)
 	return client
 }
 
+// waitForLiveConnections waits for the fake server to settle on want open
+// connections and returns what it last observed. A dropped connection is closed
+// by the server in its handler goroutine before the counter is decremented, so a
+// client that reconnects immediately can briefly observe the old and the new
+// connection together. Asserting the count without waiting makes those tests
+// flaky on a loaded runner.
+func waitForLiveConnections(t *testing.T, srv *fakeRedisServer, want int) int {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := srv.connectionCount()
+		if got == want || time.Now().After(deadline) {
+			return got
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestRedisTTLSeconds(t *testing.T) {
 	tests := []struct {
 		name string
@@ -230,7 +249,7 @@ func TestRedisProtocolErrorDiscardsConnection(t *testing.T) {
 	if err := client.ping(); err != nil {
 		t.Fatalf("ping after protocol error: %v", err)
 	}
-	if got := srv.connectionCount(); got != 1 {
+	if got := waitForLiveConnections(t, srv, 1); got != 1 {
 		t.Fatalf("expected exactly one live connection after recovery, got %d", got)
 	}
 }
@@ -322,11 +341,7 @@ func TestRedisCloseReleasesConnections(t *testing.T) {
 		t.Fatalf("expected errClientClosed, got %v", err)
 	}
 
-	deadline := time.Now().Add(time.Second)
-	for srv.connectionCount() != 0 && time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-	}
-	if got := srv.connectionCount(); got != 0 {
+	if got := waitForLiveConnections(t, srv, 0); got != 0 {
 		t.Fatalf("expected all connections to be closed, %d still open", got)
 	}
 }
@@ -491,7 +506,7 @@ func TestRedisRetriesOnceOnStaleConnection(t *testing.T) {
 		t.Fatalf("ping must recover from a stale connection, got %v", err)
 	}
 
-	if got := srv.connectionCount(); got != 1 {
+	if got := waitForLiveConnections(t, srv, 1); got != 1 {
 		t.Fatalf("expected a single live connection after the retry, got %d", got)
 	}
 	if got := srv.totalConnections(); got != 2 {
